@@ -16,7 +16,7 @@ federated = Gefedereerd
 
 ## About
 repository = Repository
-support = Support
+support = Ondersteuning
 
 ## Login
 server-question = Wat is uw server?
