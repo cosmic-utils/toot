@@ -3,7 +3,7 @@ about = Om
 view = Visa
 
 ## Navigeringsfältet
-home = Home
+home = Hem
 notifications = Aviseringar
 search = Sök
 favorites = Favoriter
@@ -37,3 +37,5 @@ status = Status
 ## Åtgärder
 reply = Svara
 cancel = Avbryt
+login = Logga in
+confirm = Bekräfta
