@@ -40,7 +40,7 @@ logout-question = Weet u zeker dat u wilt uitloggen?
 logout-description = U moet dan opnieuw inloggen om toegang te krijgen tot uw account.
 
 ## Actions
-reply = Reactie
+reply = Reageren
 cancel = Annuleren
 login = Inloggen
 confirm = Bevestigen
