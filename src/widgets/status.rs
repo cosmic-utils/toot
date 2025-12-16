@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use cosmic::{
-    app::command::Task,
+    app::Task,
     iced::{mouse::Interaction, Alignment, Length},
     iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,
@@ -141,7 +141,7 @@ pub fn update(message: Message) -> Task<app::Message> {
     }
 }
 
-fn actions(status: &Status, options: StatusOptions) -> Option<Element<Message>> {
+fn actions(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let actions = (options.actions).then_some({
@@ -232,7 +232,7 @@ fn media<'a>(
     media
 }
 
-fn tags(status: &Status, options: StatusOptions) -> Option<Element<Message>> {
+fn tags(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let tags: Option<Element<_>> = (!status.tags.is_empty() && options.tags).then(|| {
@@ -286,7 +286,7 @@ fn header<'a>(
     header
 }
 
-fn content(status: &Status, options: StatusOptions) -> Element<Message> {
+fn content(status: &Status, options: StatusOptions) -> Element<'_, Message> {
     let mut status_text: Element<_> = widget::text(
         html2text::config::rich()
             .string_from_read(status.content.as_bytes(), 700)

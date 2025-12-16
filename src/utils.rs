@@ -44,6 +44,7 @@ impl Cache {
         self.handles.insert(url, handle);
     }
 
+    #[allow(unused)]
     pub fn clear(&mut self) {
         self.statuses.clear();
         self.notifications.clear();

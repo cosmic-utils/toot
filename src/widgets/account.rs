@@ -1,6 +1,6 @@
 use capitalize::Capitalize;
 use cosmic::{
-    app::command::Task,
+    app::Task,
     iced::{alignment::Horizontal, ContentFit, Length},
     iced_widget::Stack,
     widget::{self, image::Handle},

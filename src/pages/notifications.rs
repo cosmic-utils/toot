@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use cosmic::{
-    app::command::Task,
+    app::Task,
     iced::{Length, Subscription},
     iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,

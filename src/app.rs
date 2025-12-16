@@ -142,8 +142,8 @@ impl Application for AppModel {
             .data
             .token
             .is_empty()
-            .then(|| Page::public_variants())
-            .unwrap_or_else(|| Page::variants());
+            .then(Page::public_variants)
+            .unwrap_or_else(Page::variants);
 
         for page in variants {
             let id = nav
@@ -161,7 +161,7 @@ impl Application for AppModel {
         let about = About::default()
             .name(fl!("app-title"))
             .version("0.1.0")
-            .icon(Self::APP_ID)
+            .icon(widget::icon::from_name(Self::APP_ID))
             .author("Eduardo Flores")
             .developers([("Eduardo Flores", "edfloreshz@proton.me")])
             .links([(fl!("repository"), REPOSITORY), (fl!("support"), SUPPORT)]);
@@ -195,10 +195,10 @@ impl Application for AppModel {
         (app, Task::batch(tasks))
     }
 
-    fn header_start(&self) -> Vec<Element<Self::Message>> {
+    fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
         let spacing = cosmic::theme::active().cosmic().spacing;
         let menu_bar = menu::bar(vec![menu::Tree::with_children(
-            menu::root(fl!("view")),
+            Into::<Element<Self::Message>>::into(menu::root(fl!("view"))),
             menu::items(
                 &self.key_binds,
                 vec![menu::Item::Button(
@@ -215,11 +215,11 @@ impl Application for AppModel {
         vec![menu_bar.into()]
     }
 
-    fn header_center(&self) -> Vec<Element<Self::Message>> {
+    fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
         vec![widget::text(self.instance.clone()).into()]
     }
 
-    fn header_end(&self) -> Vec<Element<Self::Message>> {
+    fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
         if self.mastodon.data.token.is_empty() {
             vec![
                 // widget::icon::from_name("network-server-symbolic")
@@ -280,16 +280,18 @@ impl Application for AppModel {
         Task::batch(tasks)
     }
 
-    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<Self::Message>> {
+    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Self::Message>> {
         if !self.core.window.show_context {
             return None;
         }
 
         Some(match &self.context_page {
-            ContextPage::About => {
-                context_drawer::about(&self.about, Message::Open, Message::ToggleContextDrawer)
-                    .title(self.context_page.title())
-            }
+            ContextPage::About => context_drawer::about(
+                &self.about,
+                |url| Message::Open(url.to_string()),
+                Message::ToggleContextDrawer,
+            )
+            .title(self.context_page.title()),
             ContextPage::Account(account) => {
                 context_drawer::context_drawer(self.account(account), Message::ToggleContextDrawer)
                     .title(self.context_page.title())
@@ -301,7 +303,7 @@ impl Application for AppModel {
         })
     }
 
-    fn dialog(&self) -> Option<Element<Self::Message>> {
+    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
         let dialog_page = self.dialog_pages.front()?;
 
         let spacing = cosmic::theme::active().cosmic().spacing;
@@ -370,7 +372,7 @@ impl Application for AppModel {
         Task::none()
     }
 
-    fn view(&self) -> Element<Self::Message> {
+    fn view(&self) -> Element<'_, Self::Message> {
         match self.nav.active_data::<Page>() {
             Some(page) => match page {
                 Page::Home => self.home.view(&self.cache).map(Message::Home),
@@ -694,7 +696,7 @@ impl AppModel {
         }
     }
 
-    fn switch_instance(&self, instance: String) -> widget::Dialog<Message> {
+    fn switch_instance(&self, instance: String) -> widget::Dialog<'_, Message> {
         widget::dialog()
             .title(fl!("server-question"))
             .body(fl!("server-description"))
@@ -704,7 +706,7 @@ impl AppModel {
                     .on_input(|instance| {
                         Message::Dialog(DialogAction::Update(Dialog::SwitchInstance(instance)))
                     })
-                    .on_submit(Message::Dialog(DialogAction::Complete)),
+                    .on_submit(|_| Message::Dialog(DialogAction::Complete)),
             )
             .primary_action(
                 widget::button::suggested(fl!("confirm"))
@@ -716,7 +718,7 @@ impl AppModel {
             )
     }
 
-    fn login(&self, instance: String) -> widget::Dialog<Message> {
+    fn login(&self, instance: String) -> widget::Dialog<'_, Message> {
         widget::dialog()
             .title(fl!("server-question"))
             .body(fl!("server-description"))
@@ -726,7 +728,7 @@ impl AppModel {
                     .on_input(move |instance| {
                         Message::Dialog(DialogAction::Update(Dialog::Login(instance.clone())))
                     })
-                    .on_submit(Message::Dialog(DialogAction::Complete)),
+                    .on_submit(|_| Message::Dialog(DialogAction::Complete)),
             )
             .primary_action(
                 widget::button::suggested(fl!("continue"))
@@ -738,7 +740,7 @@ impl AppModel {
             )
     }
 
-    fn code(&self, code: String) -> widget::Dialog<Message> {
+    fn code(&self, code: String) -> widget::Dialog<'_, Message> {
         widget::dialog()
             .title(fl!("confirm-authorization"))
             .body(fl!("confirm-authorization-description"))
@@ -746,7 +748,7 @@ impl AppModel {
             .control(
                 widget::text_input(fl!("authorization-code"), code.clone())
                     .on_input(|code| Message::Dialog(DialogAction::Update(Dialog::Code(code))))
-                    .on_submit(Message::Dialog(DialogAction::Complete)),
+                    .on_submit(|_| Message::Dialog(DialogAction::Complete)),
             )
             .primary_action(
                 widget::button::suggested(fl!("confirm"))
@@ -758,7 +760,7 @@ impl AppModel {
             )
     }
 
-    fn logout(&self) -> widget::Dialog<Message> {
+    fn logout(&self) -> widget::Dialog<'_, Message> {
         widget::dialog()
             .title(fl!("logout-question"))
             .body(fl!("logout-description"))
@@ -773,7 +775,7 @@ impl AppModel {
             )
     }
 
-    fn status(&self, id: &StatusId) -> Element<Message> {
+    fn status(&self, id: &StatusId) -> Element<'_, Message> {
         let status = self.cache.statuses.get(&id.to_string()).map(|status| {
             crate::widgets::status(
                 status,
@@ -797,7 +799,7 @@ fn instance(instance: impl Into<String>) -> String {
     let instance: String = instance.into();
     instance
         .is_empty()
-        .then(|| format!("https://{}", "mastodon.social".to_string()))
+        .then(|| format!("https://{}", "mastodon.social"))
         .unwrap_or(format!("https://{}", instance))
 }
 
@@ -817,8 +819,8 @@ where
             .data
             .token
             .is_empty()
-            .then(|| Page::public_variants())
-            .unwrap_or_else(|| Page::variants());
+            .then(Page::public_variants)
+            .unwrap_or_else(Page::variants);
 
         for page in variants {
             self.nav
