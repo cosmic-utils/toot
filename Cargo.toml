@@ -57,6 +57,8 @@ features = [
     "wayland",
     # About context drawer support
     "about",
+    # GPU acceleration
+    "wgpu",
 ]
 
 # Uncomment to test a locally-cloned libcosmic
