@@ -20,6 +20,11 @@ pub struct Cache {
     /// which statuses/relationships belong to the current user (e.g. to
     /// show a delete action only on your own posts).
     pub me: Option<Account>,
+    /// Timeline display preferences from [`crate::config::TootConfig`],
+    /// snapshotted here since it's already threaded through every feature's
+    /// `view(&Cache)` call.
+    pub hide_boosts: bool,
+    pub hide_replies: bool,
 }
 
 impl Cache {
@@ -30,7 +35,15 @@ impl Cache {
             notifications: HashMap::new(),
             relationships: HashMap::new(),
             me: None,
+            hide_boosts: false,
+            hide_replies: false,
         }
+    }
+
+    /// Whether a status should be shown given the current display preferences.
+    pub fn is_visible(&self, status: &Status) -> bool {
+        !(self.hide_boosts && status.reblog.is_some()
+            || self.hide_replies && status.in_reply_to_id.is_some())
     }
 
     pub fn insert_relationship(&mut self, relationship: Relationship) {

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: {{LICENSE}}
 
 use crate::cache::Cache;
-use crate::client::{Client, Session};
+use crate::client::{Client, Session, Sessions};
 use crate::config::TootConfig;
 use crate::features::compose;
 use crate::features::status::StatusOptions;
 use crate::features::timeline::{Timeline, TimelineKind};
-use crate::features::{accounts, hashtags, lists, notifications, search, status, timeline};
+use crate::features::{accounts, hashtags, lists, notifications, search, settings, status, timeline};
 use crate::fl;
 use cosmic::app::{context_drawer, Core, Task};
 use cosmic::cosmic_config;
@@ -118,6 +118,9 @@ pub struct AppModel {
     code: String,
     registration: Option<AppData>,
     mastodon: Client,
+    /// All saved accounts (including the currently active one) and which
+    /// index is active, persisted to the keychain as a whole.
+    sessions: Sessions,
     cache: Cache,
     toasts: Toasts<Message>,
     /// The instance's reported maximum status length, used for the compose
@@ -157,6 +160,7 @@ pub enum Message {
     Hashtags(hashtags::Message),
     Lists(lists::Message),
     Search(search::Message),
+    Settings(settings::Message),
     Account(accounts::Message),
     Status(status::Message),
     Fetch(Vec<String>),
@@ -224,19 +228,18 @@ impl Application for AppModel {
 
         let instance = instance(flags.config.server.clone());
 
-        let mastodon = match keytar::get_password(Self::APP_ID, "mastodon-data") {
-            Ok(data) if data.success => match serde_json::from_str::<Session>(&data.password) {
-                Ok(session) => Client::new(session.base_url, Some(session.token)),
-                Err(err) => {
-                    tracing::error!("{err}");
-                    Client::new(instance.clone(), None)
-                }
-            },
-            Ok(_) => Client::new(instance.clone(), None),
+        let sessions = match keytar::get_password(Self::APP_ID, "mastodon-data") {
+            Ok(data) if data.success => Sessions::parse(&data.password).unwrap_or_default(),
+            Ok(_) => Sessions::default(),
             Err(err) => {
                 tracing::error!("{err}");
-                Client::new(instance.clone(), None)
+                Sessions::default()
             }
+        };
+
+        let mastodon = match sessions.active_session() {
+            Some(session) => Client::new(session.base_url.clone(), Some(session.token.clone())),
+            None => Client::new(instance.clone(), None),
         };
 
         let variants = (!mastodon.is_authenticated())
@@ -278,7 +281,13 @@ impl Application for AppModel {
             code: String::new(),
             registration: None,
             mastodon: mastodon.clone(),
-            cache: Cache::new(),
+            sessions,
+            cache: {
+                let mut cache = Cache::new();
+                cache.hide_boosts = flags.config.hide_boosts;
+                cache.hide_replies = flags.config.hide_replies;
+                cache
+            },
             toasts: Toasts::new(Message::CloseToast),
             max_characters: 500,
             home: Timeline::new(mastodon.clone(), TimelineKind::Home),
@@ -309,11 +318,18 @@ impl Application for AppModel {
             Into::<Element<Self::Message>>::into(menu::root(fl!("view"))),
             menu::items(
                 &self.key_binds,
-                vec![menu::Item::Button(
-                    fl!("about"),
-                    Some(widget::icon::from_name("help-info-symbolic").into()),
-                    MenuAction::About,
-                )],
+                vec![
+                    menu::Item::Button(
+                        "Settings".to_string(),
+                        Some(widget::icon::from_name("preferences-system-symbolic").into()),
+                        MenuAction::Settings,
+                    ),
+                    menu::Item::Button(
+                        fl!("about"),
+                        Some(widget::icon::from_name("help-info-symbolic").into()),
+                        MenuAction::About,
+                    ),
+                ],
             ),
         )])
         .item_height(ItemHeight::Dynamic(40))
@@ -429,6 +445,12 @@ impl Application for AppModel {
             }
             ContextPage::Status(status) => {
                 context_drawer::context_drawer(self.status(status), Message::ToggleContextDrawer)
+                    .title(self.context_page.title())
+            }
+            ContextPage::Settings => {
+                let content = settings::view(&self.config, &self.sessions.sessions, self.sessions.active)
+                    .map(Message::Settings);
+                context_drawer::context_drawer(content, Message::ToggleContextDrawer)
                     .title(self.context_page.title())
             }
         })
@@ -576,6 +598,31 @@ impl Application for AppModel {
             Message::Search(message) => {
                 tasks.push(self.search.update(message));
             }
+            Message::Settings(message) => match message {
+                settings::Message::ToggleHideBoosts(hide) => {
+                    self.cache.hide_boosts = hide;
+                    if let Some(ref handler) = self.handler {
+                        if let Err(err) = self.config.set_hide_boosts(handler, hide) {
+                            tracing::error!("{err}");
+                        }
+                    }
+                }
+                settings::Message::ToggleHideReplies(hide) => {
+                    self.cache.hide_replies = hide;
+                    if let Some(ref handler) = self.handler {
+                        if let Err(err) = self.config.set_hide_replies(handler, hide) {
+                            tracing::error!("{err}");
+                        }
+                    }
+                }
+                settings::Message::SwitchAccount(index) => tasks.push(self.switch_account(index)),
+                settings::Message::RemoveAccount(index) => tasks.push(self.remove_account(index)),
+                settings::Message::AddAccount => {
+                    tasks.push(self.update(Message::Dialog(DialogAction::Open(Dialog::Login(
+                        self.instance.clone(),
+                    )))));
+                }
+            },
             Message::Account(message) => match message {
                 accounts::Message::Follow(id, following) => {
                     let mastodon = self.mastodon.clone();
@@ -766,18 +813,15 @@ impl Application for AppModel {
                     base_url: mastodon.base_url.clone(),
                     token: mastodon.token.clone().unwrap_or_default(),
                 };
-                match serde_json::to_string(&session) {
-                    Ok(data) => match keytar::set_password(Self::APP_ID, "mastodon-data", &data) {
-                        Ok(_) => {
-                            self.mastodon = mastodon;
-                            self.update_navbar();
-                            tasks.push(self.on_nav_select(self.nav.active()));
-                            tasks.push(fetch_session_info(self.mastodon.clone()));
-                        }
-                        Err(err) => tasks.push(cosmic::task::message(Message::Error(format!(
-                            "Couldn't save session: {err}"
-                        )))),
-                    },
+                self.sessions.upsert_active(session);
+                match self.persist_sessions() {
+                    Ok(_) => {
+                        self.mastodon = mastodon;
+                        self.update_navbar();
+                        tasks.push(self.on_nav_select(self.nav.active()));
+                        tasks.push(self.update_all_clients());
+                        tasks.push(fetch_session_info(self.mastodon.clone()));
+                    }
                     Err(err) => tasks.push(cosmic::task::message(Message::Error(format!(
                         "Couldn't save session: {err}"
                     )))),
@@ -903,14 +947,7 @@ impl Application for AppModel {
                                 tasks.push(self.update(Message::CompleteRegistration))
                             }
                             Dialog::Logout => {
-                                self.mastodon = Client::new(self.instance(), None);
-                                self.cache.clear();
-                                self.update_navbar();
-                                if let Err(err) =
-                                    keytar::delete_password(Self::APP_ID, "mastodon-data")
-                                {
-                                    tracing::error!("{err}");
-                                }
+                                tasks.push(self.remove_account(self.sessions.active));
                             }
                         }
                     }
@@ -936,6 +973,85 @@ impl Application for AppModel {
 }
 
 impl AppModel {
+    /// Persist the full account list (and which one is active) to the keychain.
+    fn persist_sessions(&self) -> Result<(), String> {
+        let data = serde_json::to_string(&self.sessions).map_err(|err| err.to_string())?;
+        keytar::set_password(Self::APP_ID, "mastodon-data", &data).map_err(|err| err.to_string())
+    }
+
+    /// Push the active client to every feature that holds its own copy, so
+    /// switching accounts doesn't leave a page talking to the old session.
+    fn update_all_clients(&mut self) -> Task<Message> {
+        let mastodon = self.mastodon.clone();
+        Task::batch(vec![
+            self.home.update(timeline::Message::SetClient(mastodon.clone())),
+            self.notifications
+                .update(notifications::Message::SetClient(mastodon.clone())),
+            self.explore.update(timeline::Message::SetClient(mastodon.clone())),
+            self.local.update(timeline::Message::SetClient(mastodon.clone())),
+            self.federated.update(timeline::Message::SetClient(mastodon.clone())),
+            self.favorites.update(timeline::Message::SetClient(mastodon.clone())),
+            self.bookmarks.update(timeline::Message::SetClient(mastodon.clone())),
+            self.hashtags.update(hashtags::Message::SetClient(mastodon.clone())),
+            self.lists.update(lists::Message::SetClient(mastodon.clone())),
+            self.search.update(search::Message::SetClient(mastodon)),
+        ])
+    }
+
+    /// Switch to the saved account at `index`, resetting per-account state.
+    fn switch_account(&mut self, index: usize) -> Task<Message> {
+        let Some(session) = self.sessions.sessions.get(index) else {
+            return Task::none();
+        };
+        self.sessions.active = index;
+        self.mastodon = Client::new(session.base_url.clone(), Some(session.token.clone()));
+        self.cache.clear();
+        self.cache.hide_boosts = self.config.hide_boosts;
+        self.cache.hide_replies = self.config.hide_replies;
+        self.update_navbar();
+
+        let mut tasks = vec![self.update_all_clients(), self.on_nav_select(self.nav.active())];
+        if let Err(err) = self.persist_sessions() {
+            tasks.push(cosmic::task::message(Message::Error(format!(
+                "Couldn't save session: {err}"
+            ))));
+        }
+        tasks.push(fetch_session_info(self.mastodon.clone()));
+        Task::batch(tasks)
+    }
+
+    /// Remove the saved account at `index`. If it was active, switches to
+    /// another remaining account or falls back to a logged-out client.
+    fn remove_account(&mut self, index: usize) -> Task<Message> {
+        let was_active = index == self.sessions.active;
+        self.sessions.remove(index);
+
+        let mut tasks = vec![];
+        if let Err(err) = self.persist_sessions() {
+            tasks.push(cosmic::task::message(Message::Error(format!(
+                "Couldn't save session: {err}"
+            ))));
+        }
+
+        if was_active {
+            match self.sessions.active_session().cloned() {
+                Some(session) => {
+                    self.mastodon = Client::new(session.base_url, Some(session.token));
+                }
+                None => {
+                    self.mastodon = Client::new(self.instance(), None);
+                }
+            }
+            self.cache.clear();
+            self.cache.hide_boosts = self.config.hide_boosts;
+            self.cache.hide_replies = self.config.hide_replies;
+            self.update_navbar();
+            tasks.push(self.update_all_clients());
+            tasks.push(self.on_nav_select(self.nav.active()));
+        }
+        Task::batch(tasks)
+    }
+
     pub fn update_title(&mut self) -> Task<Message> {
         let mut window_title = fl!("app-title");
         if let Some(page) = self.nav.text(self.nav.active()) {
@@ -1129,6 +1245,7 @@ pub enum ContextPage {
     About,
     Account(Account),
     Status(String),
+    Settings,
 }
 
 impl ContextPage {
@@ -1137,6 +1254,7 @@ impl ContextPage {
             ContextPage::About => fl!("about"),
             ContextPage::Account(_) => fl!("profile"),
             ContextPage::Status(_) => fl!("status"),
+            ContextPage::Settings => "Settings".to_string(),
         }
     }
 }
@@ -1144,6 +1262,7 @@ impl ContextPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
+    Settings,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -1152,6 +1271,7 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::Settings => Message::ToggleContextPage(ContextPage::Settings),
         }
     }
 }

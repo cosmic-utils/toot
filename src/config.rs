@@ -11,6 +11,10 @@ use crate::app::AppModel;
 #[version = 1]
 pub struct TootConfig {
     pub server: String,
+    /// Hide boosted (reblogged) statuses from timelines.
+    pub hide_boosts: bool,
+    /// Hide reply statuses from timelines.
+    pub hide_replies: bool,
 }
 
 impl TootConfig {

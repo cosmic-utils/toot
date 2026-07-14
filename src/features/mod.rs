@@ -8,5 +8,6 @@ pub mod hashtags;
 pub mod lists;
 pub mod notifications;
 pub mod search;
+pub mod settings;
 pub mod status;
 pub mod timeline;

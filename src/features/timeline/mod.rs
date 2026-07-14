@@ -85,6 +85,7 @@ impl Timeline {
             .statuses
             .iter()
             .filter_map(|id| cache.statuses.get(id))
+            .filter(|status| cache.is_visible(status))
             .map(|status| status::status(status, StatusOptions::all(), cache).map(Message::Status))
             .collect();
 

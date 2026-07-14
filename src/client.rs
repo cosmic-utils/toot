@@ -71,3 +71,61 @@ pub struct Session {
     pub base_url: String,
     pub token: String,
 }
+
+/// All accounts saved in the keychain, and which one is active. Persisted as
+/// a single JSON blob under one keychain entry.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Sessions {
+    pub active: usize,
+    pub sessions: Vec<Session>,
+}
+
+impl Sessions {
+    /// Parse the stored keychain payload, falling back to interpreting it as
+    /// a single legacy (pre-multi-account) session if it isn't a [`Sessions`].
+    pub fn parse(data: &str) -> Option<Sessions> {
+        if let Ok(sessions) = serde_json::from_str::<Sessions>(data) {
+            return Some(sessions);
+        }
+        serde_json::from_str::<Session>(data)
+            .ok()
+            .map(|session| Sessions {
+                active: 0,
+                sessions: vec![session],
+            })
+    }
+
+    pub fn active_session(&self) -> Option<&Session> {
+        self.sessions.get(self.active)
+    }
+
+    /// Add a session, or replace an existing one for the same instance, and
+    /// make it the active one.
+    pub fn upsert_active(&mut self, session: Session) {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|existing| existing.base_url == session.base_url)
+        {
+            self.sessions[index] = session;
+            self.active = index;
+        } else {
+            self.sessions.push(session);
+            self.active = self.sessions.len() - 1;
+        }
+    }
+
+    /// Remove the session at `index`. If it was the active one, activate the
+    /// previous session (or the new one at the same position), if any remain.
+    pub fn remove(&mut self, index: usize) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        self.sessions.remove(index);
+        if self.sessions.is_empty() {
+            self.active = 0;
+        } else {
+            self.active = self.active.min(self.sessions.len() - 1);
+        }
+    }
+}
