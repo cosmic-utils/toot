@@ -4,7 +4,7 @@ use cosmic::{
     iced::core::image,
     widget::{self, image::Handle},
 };
-use megalodon::entities::{Notification, Status};
+use megalodon::entities::{Account, Notification, Relationship, Status};
 
 use crate::error::Error;
 
@@ -13,6 +13,13 @@ pub struct Cache {
     pub handles: HashMap<String, Handle>,
     pub statuses: HashMap<String, Status>,
     pub notifications: HashMap<String, Notification>,
+    /// The authenticated user's relationship (following/muting/blocking) to
+    /// each account whose profile has been viewed, keyed by account id.
+    pub relationships: HashMap<String, Relationship>,
+    /// The currently authenticated account, if logged in. Used to decide
+    /// which statuses/relationships belong to the current user (e.g. to
+    /// show a delete action only on your own posts).
+    pub me: Option<Account>,
 }
 
 impl Cache {
@@ -21,7 +28,19 @@ impl Cache {
             handles: HashMap::new(),
             statuses: HashMap::new(),
             notifications: HashMap::new(),
+            relationships: HashMap::new(),
+            me: None,
         }
+    }
+
+    pub fn insert_relationship(&mut self, relationship: Relationship) {
+        self.relationships
+            .insert(relationship.id.clone(), relationship);
+    }
+
+    /// Whether the given account id belongs to the authenticated user.
+    pub fn is_me(&self, account_id: &str) -> bool {
+        self.me.as_ref().is_some_and(|account| account.id == account_id)
     }
 
     pub fn insert_status(&mut self, status: Status) {
@@ -43,11 +62,12 @@ impl Cache {
         self.handles.insert(url, handle);
     }
 
-    #[allow(unused)]
     pub fn clear(&mut self) {
         self.statuses.clear();
         self.notifications.clear();
         self.handles.clear();
+        self.relationships.clear();
+        self.me = None;
     }
 }
 

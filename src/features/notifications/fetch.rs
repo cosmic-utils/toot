@@ -2,14 +2,18 @@ use cosmic::iced::{stream, Subscription};
 use futures_util::SinkExt;
 use megalodon::megalodon::GetNotificationsInputOptions;
 
-use crate::{mastodon::Client, pages};
+use crate::client::Client;
 
-pub fn timeline(mastodon: Client) -> Subscription<pages::notifications::Message> {
-    Subscription::run_with(mastodon, |mastodon| {
+use super::Message;
+
+pub fn timeline(mastodon: Client, max_id: Option<String>) -> Subscription<Message> {
+    Subscription::run_with((mastodon, max_id), |(mastodon, max_id)| {
         let mastodon = mastodon.clone();
-        stream::channel(1, move |mut output: futures_channel::mpsc::Sender<pages::notifications::Message>| async move {
+        let max_id = max_id.clone();
+        stream::channel(1, move |mut output: futures_channel::mpsc::Sender<Message>| async move {
             let options = GetNotificationsInputOptions {
-                limit: Some(100),
+                limit: Some(30),
+                max_id,
                 ..Default::default()
             };
 
@@ -17,9 +21,7 @@ pub fn timeline(mastodon: Client) -> Subscription<pages::notifications::Message>
                 Ok(response) => {
                     for notification in response.json {
                         if let Err(err) = output
-                            .send(pages::notifications::Message::AppendNotification(
-                                notification.clone(),
-                            ))
+                            .send(Message::AppendNotification(notification.clone()))
                             .await
                         {
                             tracing::warn!("failed to send post: {}", err);

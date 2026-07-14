@@ -8,7 +8,8 @@ use megalodon::entities::{Account, Status};
 
 use crate::{
     app,
-    utils::{self, Cache},
+    cache::{self, Cache},
+    features::compose,
 };
 
 #[derive(Debug, Clone)]
@@ -18,7 +19,11 @@ pub enum Message {
     Reply(String, String),
     Favorite(String, bool),
     Boost(String, bool),
+    Bookmark(String, bool),
     OpenLink(String),
+    /// Request to delete one of the authenticated user's own statuses;
+    /// opens a confirmation dialog rather than deleting immediately.
+    Delete(String),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -68,7 +73,7 @@ pub fn status<'a>(
         card(status, cache),
         media(status, cache, options),
         tags(status, options),
-        actions(status, options),
+        actions(status, options, cache),
     ]
     .padding(spacing.space_xs)
     .spacing(spacing.space_xs)
@@ -84,7 +89,7 @@ fn card<'a>(status: &'a Status, cache: &'a Cache) -> Option<Element<'a, Message>
                 .handles
                 .get(image)
                 .map(widget::image)
-                .unwrap_or(utils::fallback_avatar())
+                .unwrap_or(cache::fallback_avatar())
         });
 
         widget::column![
@@ -114,13 +119,9 @@ pub fn update(message: Message) -> Task<app::Message> {
             app::ContextPage::Status(id),
         )),
         Message::Reply(status_id, username) => {
-            let new_status = app::NewStatus {
-                in_reply_to_id: Some(status_id.to_string()),
-                status: Some(format!("@{} ", username)),
-                ..Default::default()
-            };
+            let state = compose::State::reply(status_id, username);
             cosmic::task::message(app::Message::Dialog(app::DialogAction::Open(
-                app::Dialog::Reply(new_status),
+                app::Dialog::Compose(state),
             )))
         }
         Message::Favorite(status_id, favorited) => cosmic::task::message(app::Message::Status(
@@ -129,12 +130,23 @@ pub fn update(message: Message) -> Task<app::Message> {
         Message::Boost(status_id, boosted) => {
             cosmic::task::message(app::Message::Status(Message::Boost(status_id, boosted)))
         }
+        Message::Bookmark(status_id, bookmarked) => cosmic::task::message(app::Message::Status(
+            Message::Bookmark(status_id, bookmarked),
+        )),
         Message::OpenLink(url) => cosmic::task::message(app::Message::Open(url.to_string())),
+        Message::Delete(status_id) => cosmic::task::message(app::Message::Dialog(
+            app::DialogAction::Open(app::Dialog::DeleteStatus(status_id)),
+        )),
     }
 }
 
-fn actions(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>> {
+fn actions<'a>(status: &'a Status, options: StatusOptions, cache: &'a Cache) -> Option<Element<'a, Message>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
+
+    let delete_button = cache.is_me(&status.account.id).then(|| {
+        widget::button::icon(widget::icon::from_name("user-trash-symbolic"))
+            .on_press(Message::Delete(status.id.clone()))
+    });
 
     let actions = (options.actions).then_some({
         widget::row![
@@ -182,7 +194,27 @@ fn actions(status: &Status, options: StatusOptions) -> Option<Element<'_, Messag
                         .favourited
                         .map(|favourited| Message::Favorite(status.id.clone(), favourited)),
                 ),
+            widget::button::icon(widget::icon::from_name("bookmark-new-symbolic"))
+                .class(
+                    status
+                        .bookmarked
+                        .map(|bookmarked| {
+                            if bookmarked {
+                                cosmic::theme::Button::Suggested
+                            } else {
+                                cosmic::theme::Button::Icon
+                            }
+                        })
+                        .unwrap_or(cosmic::theme::Button::Icon),
+                )
+                .on_press_maybe(
+                    status
+                        .bookmarked
+                        .map(|bookmarked| Message::Bookmark(status.id.clone(), bookmarked)),
+                ),
+            widget::space::horizontal(),
         ]
+        .push_maybe(delete_button)
         .spacing(spacing.space_xs)
         .into()
     });
@@ -206,7 +238,7 @@ fn media<'a>(
                     .as_ref()
                     .and_then(|url| cache.handles.get(url))
                     .cloned()
-                    .unwrap_or(crate::utils::fallback_handle()),
+                    .unwrap_or(crate::cache::fallback_handle()),
             )
             .on_press(Message::OpenLink(media.url.clone()))
             .into()
@@ -250,7 +282,7 @@ fn header<'a>(
                 .handles
                 .get(&status.account.avatar)
                 .cloned()
-                .unwrap_or(crate::utils::fallback_handle()),
+                .unwrap_or(crate::cache::fallback_handle()),
         )
         .width(50)
         .height(50)
@@ -295,7 +327,7 @@ fn reblog_button<'a>(cache: &'a Cache, status: &'a Status) -> Option<widget::But
                     .handles
                     .get(&status.account.avatar)
                     .map(|avatar| widget::image(avatar).width(20).height(20))
-                    .unwrap_or(crate::utils::fallback_avatar().width(20).height(20)),
+                    .unwrap_or(crate::cache::fallback_avatar().width(20).height(20)),
                 widget::text(format!("{} boosted", status.account.display_name)),
             ]
             .spacing(spacing.space_xs),

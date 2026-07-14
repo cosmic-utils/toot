@@ -1,13 +1,11 @@
-use crate::pages;
+//! Real-time streaming of the authenticated user's events (new posts,
+//! notifications, deletions), pushed into the relevant feature's message type.
+
 use cosmic::iced::{stream, Subscription};
 use futures_util::SinkExt;
 use megalodon::streaming::Message as StreamMessage;
 
-use crate::{app, mastodon::Client};
-
-pub mod home;
-pub mod notifications;
-pub mod public;
+use crate::{app, client::Client, features::notifications, features::timeline};
 
 pub fn stream_user_events(mastodon: Client) -> Subscription<app::Message> {
     Subscription::run_with(mastodon, |mastodon| {
@@ -22,7 +20,7 @@ pub fn stream_user_events(mastodon: Client) -> Subscription<app::Message> {
                         match message {
                             StreamMessage::Update(status) => {
                                 if let Err(err) = output
-                                    .send(app::Message::Home(pages::home::Message::PrependStatus(
+                                    .send(app::Message::Home(timeline::Message::PrependStatus(
                                         status,
                                     )))
                                     .await
@@ -33,9 +31,7 @@ pub fn stream_user_events(mastodon: Client) -> Subscription<app::Message> {
                             StreamMessage::Notification(notification) => {
                                 if let Err(err) = output
                                     .send(app::Message::Notifications(
-                                        pages::notifications::Message::PrependNotification(
-                                            notification,
-                                        ),
+                                        notifications::Message::PrependNotification(notification),
                                     ))
                                     .await
                                 {
@@ -44,9 +40,7 @@ pub fn stream_user_events(mastodon: Client) -> Subscription<app::Message> {
                             }
                             StreamMessage::Delete(id) => {
                                 if let Err(err) = output
-                                    .send(app::Message::Home(pages::home::Message::DeleteStatus(
-                                        id,
-                                    )))
+                                    .send(app::Message::Home(timeline::Message::DeleteStatus(id)))
                                     .await
                                 {
                                     tracing::warn!("failed to send post: {}", err);

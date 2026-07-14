@@ -44,3 +44,14 @@ reply = Reply
 cancel = Cancel
 login = Login
 confirm = Confirm
+
+## Compose
+new-post = New post
+post = Post
+whats-happening = What's happening?
+content-warning = Content warning
+content-warning-placeholder = Write your warning here
+delete-status = Delete
+delete-status-question = Delete this post?
+delete-status-description = This cannot be undone.
+delete = Delete

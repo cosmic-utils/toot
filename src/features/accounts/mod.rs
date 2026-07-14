@@ -1,25 +1,29 @@
+//! Account profile view: bio/stats plus follow/mute/block relationship actions.
+
 use capitalize::Capitalize;
 use cosmic::{
     app::Task,
     iced::{self, alignment::Horizontal, ContentFit, Length},
-    widget::{self, image::Handle},
-    Apply, Element,
+    widget, Apply, Element,
 };
-use megalodon::entities::Account;
-use std::collections::HashMap;
+use megalodon::entities::{Account, Relationship};
 
 use crate::app;
+use crate::cache::Cache;
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Open(String),
+    Follow(String, bool),
+    Mute(String, bool),
+    Block(String, bool),
 }
 
-pub fn account<'a>(
-    account: &'a Account,
-    handles: &'a HashMap<String, Handle>,
-) -> Element<'a, Message> {
+pub fn account<'a>(account: &'a Account, cache: &'a Cache) -> Element<'a, Message> {
     let spacing = cosmic::theme::active().cosmic().spacing;
+    let handles = &cache.handles;
+    let relationship = cache.relationships.get(&account.id);
+    let is_me = cache.is_me(&account.id);
 
     let header = handles.get(&account.header).map(|handle| {
         widget::image(handle)
@@ -95,25 +99,64 @@ pub fn account<'a>(
     )
     .class(cosmic::style::Container::Card);
 
+    let relationship_actions = (!is_me).then(|| relationship_actions(account, relationship));
+
     let settings = (!fields.is_empty()).then_some(widget::settings::section().extend(fields));
-    let content = widget::column![stack, display_name, username, bio, joined, info, settings]
-        .align_x(Horizontal::Center)
-        .width(Length::Fill)
-        .spacing(spacing.space_xs);
+    let content = widget::column![
+        stack,
+        display_name,
+        username,
+        relationship_actions,
+        bio,
+        joined,
+        info,
+        settings
+    ]
+    .align_x(Horizontal::Center)
+    .width(Length::Fill)
+    .spacing(spacing.space_xs);
 
     widget::settings::flex_item_row(vec![content.into()])
         .padding(spacing.space_xs)
         .into()
 }
 
+fn relationship_actions<'a>(
+    account: &'a Account,
+    relationship: Option<&'a Relationship>,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::active().cosmic().spacing;
+
+    let following = relationship.is_some_and(|r| r.following);
+    let muting = relationship.is_some_and(|r| r.muting);
+    let blocking = relationship.is_some_and(|r| r.blocking);
+
+    widget::row![
+        widget::button::text(if following { "Unfollow" } else { "Follow" })
+            .class(if following {
+                cosmic::theme::Button::Standard
+            } else {
+                cosmic::theme::Button::Suggested
+            })
+            .on_press(Message::Follow(account.id.clone(), following)),
+        widget::button::text(if muting { "Unmute" } else { "Mute" })
+            .on_press(Message::Mute(account.id.clone(), muting)),
+        widget::button::text(if blocking { "Unblock" } else { "Block" })
+            .class(cosmic::theme::Button::Destructive)
+            .on_press(Message::Block(account.id.clone(), blocking)),
+    ]
+    .spacing(spacing.space_xs)
+    .into()
+}
+
+/// Handles [`Message::Open`] directly; [`Message::Follow`]/[`Message::Mute`]/
+/// [`Message::Block`] carry no view-only behavior of their own — they're
+/// intercepted in [`app::AppModel::update`] to perform the actual API call.
 pub fn update(message: Message) -> Task<app::Message> {
-    let tasks = vec![];
-    match message {
-        Message::Open(url) => {
-            if let Err(err) = open::that_detached(url.to_string()) {
-                tracing::error!("{err}");
-            }
+    if let Message::Open(url) = message {
+        if let Err(err) = open::that_detached(&url) {
+            tracing::error!("{err}");
         }
     }
-    Task::batch(tasks)
+    Task::none()
 }

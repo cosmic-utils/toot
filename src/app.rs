@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: {{LICENSE}}
 
+use crate::cache::Cache;
+use crate::client::{Client, Session};
 use crate::config::TootConfig;
-use crate::pages::public::TimelineType;
-use crate::pages::Page;
-use crate::utils::{self, Cache};
-use crate::widgets::status::StatusOptions;
-use crate::{fl, pages, widgets};
+use crate::features::compose;
+use crate::features::status::StatusOptions;
+use crate::features::timeline::{Timeline, TimelineKind};
+use crate::features::{accounts, hashtags, lists, notifications, search, status, timeline};
+use crate::fl;
 use cosmic::app::{context_drawer, Core, Task};
 use cosmic::cosmic_config;
 use cosmic::iced::alignment::{Horizontal, Vertical};
@@ -13,6 +15,7 @@ use cosmic::iced::{Length, Subscription};
 use cosmic::widget::about::About;
 use cosmic::widget::image::Handle;
 use cosmic::widget::menu::{ItemHeight, ItemWidth};
+use cosmic::widget::toaster::{Toast, ToastId, Toasts};
 use cosmic::widget::{self, menu, nav_bar};
 use cosmic::{Application, ApplicationExt, Apply, Element};
 use megalodon::entities::{Account, Notification, Status};
@@ -20,11 +23,86 @@ use megalodon::megalodon::PostStatusInputOptions;
 use megalodon::oauth::AppData;
 
 use std::collections::{HashMap, VecDeque};
-
-use crate::mastodon::{Client, Session};
+use std::fmt::Display;
 
 const REPOSITORY: &str = "https://github.com/edfloreshz/toot";
 const SUPPORT: &str = "https://github.com/edfloreshz/toot/issues";
+
+/// A nav-bar destination. Some variants are not yet backed by a feature — see
+/// `view`/`on_nav_select`/`subscription`'s fallback arms.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Page {
+    #[default]
+    Home,
+    Notifications,
+    Search,
+    Favorites,
+    Bookmarks,
+    Hashtags,
+    Lists,
+    Explore,
+    Local,
+    Federated,
+}
+
+impl Display for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Page::Home => write!(f, "{}", fl!("home")),
+            Page::Notifications => write!(f, "{}", fl!("notifications")),
+            Page::Search => write!(f, "{}", fl!("search")),
+            Page::Favorites => write!(f, "{}", fl!("favorites")),
+            Page::Bookmarks => write!(f, "{}", fl!("bookmarks")),
+            Page::Hashtags => write!(f, "{}", fl!("hashtags")),
+            Page::Lists => write!(f, "{}", fl!("lists")),
+            Page::Explore => write!(f, "{}", fl!("explore")),
+            Page::Local => write!(f, "{}", fl!("local")),
+            Page::Federated => write!(f, "{}", fl!("federated")),
+        }
+    }
+}
+
+impl Page {
+    pub fn public_variants() -> Vec<Page> {
+        vec![
+            Self::Explore,
+            Self::Local,
+            Self::Federated,
+            Self::Search,
+            Self::Hashtags,
+        ]
+    }
+
+    pub fn variants() -> Vec<Page> {
+        vec![
+            Self::Home,
+            Self::Notifications,
+            Self::Search,
+            Self::Favorites,
+            Self::Bookmarks,
+            Self::Hashtags,
+            Self::Lists,
+            Self::Explore,
+            Self::Local,
+            Self::Federated,
+        ]
+    }
+
+    pub fn icon(&self) -> &str {
+        match self {
+            Page::Home => "user-home-symbolic",
+            Page::Notifications => "emblem-important-symbolic",
+            Page::Search => "folder-saved-search-symbolic",
+            Page::Favorites => "starred-symbolic",
+            Page::Bookmarks => "bookmark-new-symbolic",
+            Page::Hashtags => "lang-include-symbolic",
+            Page::Lists => "view-list-symbolic",
+            Page::Explore => "find-location-symbolic",
+            Page::Local => "network-server-symbolic",
+            Page::Federated => "network-workgroup-symbolic",
+        }
+    }
+}
 
 pub struct AppModel {
     core: Core,
@@ -41,11 +119,21 @@ pub struct AppModel {
     registration: Option<AppData>,
     mastodon: Client,
     cache: Cache,
-    home: pages::home::Home,
-    notifications: pages::notifications::Notifications,
-    explore: pages::public::Public,
-    local: pages::public::Public,
-    federated: pages::public::Public,
+    toasts: Toasts<Message>,
+    /// The instance's reported maximum status length, used for the compose
+    /// dialog's character counter. Defaults to Mastodon's standard limit
+    /// until the real value is fetched after login.
+    max_characters: u32,
+    home: Timeline,
+    notifications: notifications::Notifications,
+    explore: Timeline,
+    local: Timeline,
+    federated: Timeline,
+    favorites: Timeline,
+    bookmarks: Timeline,
+    hashtags: hashtags::Hashtags,
+    lists: lists::Lists,
+    search: search::Search,
 }
 
 #[derive(Debug, Clone)]
@@ -59,20 +147,38 @@ pub enum Message {
     CompleteRegistration,
     StoreMastodonData(Client),
     StoreRegistration(Option<AppData>),
-    Home(pages::home::Message),
-    Notifications(pages::notifications::Message),
-    Explore(pages::public::Message),
-    Local(pages::public::Message),
-    Federated(pages::public::Message),
-    Account(widgets::account::Message),
-    Status(widgets::status::Message),
+    Home(timeline::Message),
+    Notifications(notifications::Message),
+    Explore(timeline::Message),
+    Local(timeline::Message),
+    Federated(timeline::Message),
+    Favorites(timeline::Message),
+    Bookmarks(timeline::Message),
+    Hashtags(hashtags::Message),
+    Lists(lists::Message),
+    Search(search::Message),
+    Account(accounts::Message),
+    Status(status::Message),
     Fetch(Vec<String>),
     CacheStatus(Status),
     CacheNotification(Notification),
+    CacheRelationship(megalodon::entities::Relationship),
     CacheHandle(String, Handle),
     Dialog(DialogAction),
     EditorAction(widget::text_editor::Action),
     UpdateMastodonInstance,
+    /// The authenticated account, cached right after login (and at startup
+    /// if a saved session is restored) so posts/relationships can be
+    /// compared against "me".
+    SetAccount(Account),
+    /// The instance's max status length, fetched right after login.
+    SetMaxCharacters(u32),
+    /// A status was deleted on the server; remove it from the cache.
+    StatusDeleted(String),
+    /// A recoverable error to surface to the user as a toast instead of
+    /// only logging it and silently dropping the failed action.
+    Error(String),
+    CloseToast(ToastId),
     None,
 }
 
@@ -84,19 +190,14 @@ pub enum DialogAction {
     Complete,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NewStatus {
-    pub in_reply_to_id: Option<String>,
-    pub status: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub enum Dialog {
-    Reply(NewStatus),
+    Compose(compose::State),
     SwitchInstance(String),
     Login(String),
     Code(String),
     Logout,
+    DeleteStatus(String),
 }
 
 pub struct Flags {
@@ -178,16 +279,26 @@ impl Application for AppModel {
             registration: None,
             mastodon: mastodon.clone(),
             cache: Cache::new(),
-            home: pages::home::Home::new(mastodon.clone()),
-            notifications: pages::notifications::Notifications::new(mastodon.clone()),
-            explore: pages::public::Public::new(mastodon.clone(), TimelineType::Public),
-            local: pages::public::Public::new(mastodon.clone(), TimelineType::Local),
-            federated: pages::public::Public::new(mastodon.clone(), TimelineType::Remote),
+            toasts: Toasts::new(Message::CloseToast),
+            max_characters: 500,
+            home: Timeline::new(mastodon.clone(), TimelineKind::Home),
+            notifications: notifications::Notifications::new(mastodon.clone()),
+            explore: Timeline::new(mastodon.clone(), TimelineKind::Public),
+            local: Timeline::new(mastodon.clone(), TimelineKind::Local),
+            federated: Timeline::new(mastodon.clone(), TimelineKind::Federated),
+            favorites: Timeline::new(mastodon.clone(), TimelineKind::Favorites),
+            bookmarks: Timeline::new(mastodon.clone(), TimelineKind::Bookmarks),
+            hashtags: hashtags::Hashtags::new(mastodon.clone()),
+            lists: lists::Lists::new(mastodon.clone()),
+            search: search::Search::new(mastodon.clone()),
         };
 
         app.nav.activate_position(0);
 
-        let tasks = vec![app.update_title()];
+        let mut tasks = vec![app.update_title()];
+        if mastodon.is_authenticated() {
+            tasks.push(fetch_session_info(mastodon));
+        }
 
         (app, Task::batch(tasks))
     }
@@ -233,10 +344,18 @@ impl Application for AppModel {
                     .into(),
             ]
         } else {
-            vec![widget::icon::from_name("system-log-out-symbolic")
-                .apply(widget::button::icon)
-                .on_press(Message::Dialog(DialogAction::Open(Dialog::Logout)))
-                .into()]
+            vec![
+                widget::icon::from_name("list-add-symbolic")
+                    .apply(widget::button::icon)
+                    .on_press(Message::Dialog(DialogAction::Open(Dialog::Compose(
+                        compose::State::default(),
+                    ))))
+                    .into(),
+                widget::icon::from_name("system-log-out-symbolic")
+                    .apply(widget::button::icon)
+                    .on_press(Message::Dialog(DialogAction::Open(Dialog::Logout)))
+                    .into(),
+            ]
         }
     }
 
@@ -250,27 +369,42 @@ impl Application for AppModel {
         match self.nav.data::<Page>(id).unwrap() {
             Page::Home => tasks.push(
                 self.home
-                    .update(pages::home::Message::SetClient(self.mastodon.clone())),
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
             Page::Notifications => tasks.push(self.notifications.update(
-                pages::notifications::Message::SetClient(self.mastodon.clone()),
+                notifications::Message::SetClient(self.mastodon.clone()),
             )),
-            Page::Search => (),
-            Page::Favorites => (),
-            Page::Bookmarks => (),
-            Page::Hashtags => (),
-            Page::Lists => (),
+            Page::Search => tasks.push(
+                self.search
+                    .update(search::Message::SetClient(self.mastodon.clone())),
+            ),
+            Page::Favorites => tasks.push(
+                self.favorites
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
+            ),
+            Page::Bookmarks => tasks.push(
+                self.bookmarks
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
+            ),
+            Page::Hashtags => tasks.push(
+                self.hashtags
+                    .update(hashtags::Message::SetClient(self.mastodon.clone())),
+            ),
+            Page::Lists => tasks.push(
+                self.lists
+                    .update(lists::Message::SetClient(self.mastodon.clone())),
+            ),
             Page::Explore => tasks.push(
                 self.explore
-                    .update(pages::public::Message::SetClient(self.mastodon.clone())),
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
             Page::Local => tasks.push(
                 self.local
-                    .update(pages::public::Message::SetClient(self.mastodon.clone())),
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
             Page::Federated => tasks.push(
                 self.federated
-                    .update(pages::public::Message::SetClient(self.mastodon.clone())),
+                    .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
         };
         tasks.push(self.update_title());
@@ -303,48 +437,24 @@ impl Application for AppModel {
     fn dialog(&self) -> Option<Element<'_, Self::Message>> {
         let dialog_page = self.dialog_pages.front()?;
 
-        let spacing = cosmic::theme::active().cosmic().spacing;
-
         let dialog = match dialog_page {
-            Dialog::Reply(new_status) => widget::dialog()
-                .title(fl!("reply"))
-                .control(
-                    widget::container(
-                        widget::scrollable(
-                            widget::column![
-                                self.cache
-                                    .statuses
-                                    .get(&new_status.in_reply_to_id.clone().unwrap())
-                                    .map(|status| {
-                                        widgets::status(status, StatusOptions::none(), &self.cache)
-                                            .map(Message::Status)
-                                            .apply(widget::container)
-                                            .class(cosmic::style::Container::Card)
-                                    }),
-                                widget::text_editor(&self.dialog_editor)
-                                    .height(200.)
-                                    .padding(spacing.space_s)
-                                    .on_action(Message::EditorAction),
-                            ]
-                            .spacing(spacing.space_xs),
-                        )
-                        .width(Length::Fill),
-                    )
-                    .height(Length::Fixed(400.0))
-                    .width(Length::Fill),
-                )
-                .primary_action(
-                    widget::button::suggested(fl!("reply"))
-                        .on_press_maybe(Some(Message::Dialog(DialogAction::Complete))),
-                )
-                .secondary_action(
-                    widget::button::standard(fl!("cancel"))
-                        .on_press(Message::Dialog(DialogAction::Close)),
-                ),
+            Dialog::Compose(state) => {
+                let reply_preview = state.in_reply_to_id.as_ref().and_then(|id| {
+                    self.cache.statuses.get(id).map(|reply_target| {
+                        status::status(reply_target, StatusOptions::none(), &self.cache)
+                            .map(Message::Status)
+                            .apply(widget::container)
+                            .class(cosmic::style::Container::Card)
+                            .into()
+                    })
+                });
+                compose::view(state, reply_preview, &self.dialog_editor, self.max_characters)
+            }
             Dialog::SwitchInstance(instance) => self.switch_instance(instance.clone()),
             Dialog::Login(instance) => self.login(instance.clone()),
             Dialog::Code(code) => self.code(code.clone()),
             Dialog::Logout => self.logout(),
+            Dialog::DeleteStatus(id) => self.delete_status(id.clone()),
         };
 
         Some(dialog.into())
@@ -363,7 +473,7 @@ impl Application for AppModel {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        match self.nav.active_data::<Page>() {
+        let content = match self.nav.active_data::<Page>() {
             Some(page) => match page {
                 Page::Home => self.home.view(&self.cache).map(Message::Home),
                 Page::Notifications => self
@@ -373,7 +483,11 @@ impl Application for AppModel {
                 Page::Explore => self.explore.view(&self.cache).map(Message::Explore),
                 Page::Local => self.local.view(&self.cache).map(Message::Local),
                 Page::Federated => self.federated.view(&self.cache).map(Message::Federated),
-                _ => widget::text("Not yet implemented").into(),
+                Page::Favorites => self.favorites.view(&self.cache).map(Message::Favorites),
+                Page::Bookmarks => self.bookmarks.view(&self.cache).map(Message::Bookmarks),
+                Page::Hashtags => self.hashtags.view(&self.cache).map(Message::Hashtags),
+                Page::Lists => self.lists.view(&self.cache).map(Message::Lists),
+                Page::Search => self.search.view(&self.cache).map(Message::Search),
             },
             None => widget::text("Select a page").into(),
         }
@@ -381,8 +495,9 @@ impl Application for AppModel {
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Horizontal::Center)
-        .align_y(Vertical::Center)
-        .into()
+        .align_y(Vertical::Center);
+
+        widget::toaster(&self.toasts, content)
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -398,11 +513,19 @@ impl Application for AppModel {
                     .subscription()
                     .map(Message::Notifications),
             ),
-            Some(Page::Search) => (),
-            Some(Page::Favorites) => (),
-            Some(Page::Bookmarks) => (),
-            Some(Page::Hashtags) => (),
-            Some(Page::Lists) => (),
+            Some(Page::Search) => {
+                subscriptions.push(self.search.subscription().map(Message::Search))
+            }
+            Some(Page::Favorites) => {
+                subscriptions.push(self.favorites.subscription().map(Message::Favorites))
+            }
+            Some(Page::Bookmarks) => {
+                subscriptions.push(self.bookmarks.subscription().map(Message::Bookmarks))
+            }
+            Some(Page::Hashtags) => {
+                subscriptions.push(self.hashtags.subscription().map(Message::Hashtags))
+            }
+            Some(Page::Lists) => subscriptions.push(self.lists.subscription().map(Message::Lists)),
             Some(Page::Explore) => {
                 subscriptions.push(self.explore.subscription().map(Message::Explore))
             }
@@ -414,9 +537,7 @@ impl Application for AppModel {
         };
 
         if self.mastodon.is_authenticated() {
-            subscriptions.push(crate::subscriptions::stream_user_events(
-                self.mastodon.clone(),
-            ));
+            subscriptions.push(crate::streaming::stream_user_events(self.mastodon.clone()));
         }
 
         Subscription::batch(subscriptions)
@@ -440,9 +561,68 @@ impl Application for AppModel {
             Message::Federated(message) => {
                 tasks.push(self.federated.update(message));
             }
-            Message::Account(message) => tasks.push(widgets::account::update(message)),
+            Message::Favorites(message) => {
+                tasks.push(self.favorites.update(message));
+            }
+            Message::Bookmarks(message) => {
+                tasks.push(self.bookmarks.update(message));
+            }
+            Message::Hashtags(message) => {
+                tasks.push(self.hashtags.update(message));
+            }
+            Message::Lists(message) => {
+                tasks.push(self.lists.update(message));
+            }
+            Message::Search(message) => {
+                tasks.push(self.search.update(message));
+            }
+            Message::Account(message) => match message {
+                accounts::Message::Follow(id, following) => {
+                    let mastodon = self.mastodon.clone();
+                    tasks.push(cosmic::task::future(async move {
+                        let result = if following {
+                            mastodon.unfollow_account(id).await
+                        } else {
+                            mastodon.follow_account(id, None).await
+                        };
+                        match result {
+                            Ok(response) => Message::CacheRelationship(response.json),
+                            Err(err) => Message::Error(format!("Couldn't update follow: {err}")),
+                        }
+                    }))
+                }
+                accounts::Message::Mute(id, muting) => {
+                    let mastodon = self.mastodon.clone();
+                    tasks.push(cosmic::task::future(async move {
+                        let result = if muting {
+                            mastodon.unmute_account(id).await
+                        } else {
+                            mastodon.mute_account(id, true).await
+                        };
+                        match result {
+                            Ok(response) => Message::CacheRelationship(response.json),
+                            Err(err) => Message::Error(format!("Couldn't update mute: {err}")),
+                        }
+                    }))
+                }
+                accounts::Message::Block(id, blocking) => {
+                    let mastodon = self.mastodon.clone();
+                    tasks.push(cosmic::task::future(async move {
+                        let result = if blocking {
+                            mastodon.unblock_account(id).await
+                        } else {
+                            mastodon.block_account(id).await
+                        };
+                        match result {
+                            Ok(response) => Message::CacheRelationship(response.json),
+                            Err(err) => Message::Error(format!("Couldn't update block: {err}")),
+                        }
+                    }))
+                }
+                _ => tasks.push(accounts::update(message)),
+            },
             Message::Status(message) => match message {
-                widgets::status::Message::Favorite(status_id, favorited) => {
+                status::Message::Favorite(status_id, favorited) => {
                     let mastodon = self.mastodon.clone();
                     tasks.push(cosmic::task::future(async move {
                         let result = if favorited {
@@ -452,14 +632,11 @@ impl Application for AppModel {
                         };
                         match result {
                             Ok(response) => Message::CacheStatus(response.json),
-                            Err(err) => {
-                                tracing::error!("{err}");
-                                Message::None
-                            }
+                            Err(err) => Message::Error(format!("Couldn't update favorite: {err}")),
                         }
                     }))
                 }
-                widgets::status::Message::Boost(status_id, boosted) => {
+                status::Message::Boost(status_id, boosted) => {
                     let mastodon = self.mastodon.clone();
                     tasks.push(cosmic::task::future(async move {
                         let result = if boosted {
@@ -469,15 +646,25 @@ impl Application for AppModel {
                         };
                         match result {
                             Ok(response) => Message::CacheStatus(response.json),
-                            Err(err) => {
-                                tracing::error!("{err}");
-                                Message::None
-                            }
+                            Err(err) => Message::Error(format!("Couldn't update boost: {err}")),
                         }
                     }))
                 }
-                widgets::status::Message::OpenLink(_) => todo!(),
-                _ => tasks.push(widgets::status::update(message)),
+                status::Message::Bookmark(status_id, bookmarked) => {
+                    let mastodon = self.mastodon.clone();
+                    tasks.push(cosmic::task::future(async move {
+                        let result = if bookmarked {
+                            mastodon.unbookmark_status(status_id).await
+                        } else {
+                            mastodon.bookmark_status(status_id).await
+                        };
+                        match result {
+                            Ok(response) => Message::CacheStatus(response.json),
+                            Err(err) => Message::Error(format!("Couldn't update bookmark: {err}")),
+                        }
+                    }))
+                }
+                _ => tasks.push(status::update(message)),
             },
             Message::CacheHandle(url, handle) => {
                 self.cache.insert_handle(url.clone(), handle);
@@ -488,11 +675,14 @@ impl Application for AppModel {
             Message::CacheNotification(notification) => {
                 self.cache.insert_notification(notification.clone());
             }
+            Message::CacheRelationship(relationship) => {
+                self.cache.insert_relationship(relationship);
+            }
             Message::Fetch(urls) => {
                 for url in urls {
                     if !self.cache.handles.contains_key(&url) {
                         tasks.push(cosmic::task::future(async move {
-                            let result = match utils::get(&url).await {
+                            let result = match crate::cache::get(&url).await {
                                 Ok(handle) => Some((url, handle)),
                                 Err(err) => {
                                     tracing::error!("Failed to fetch image: {}", err);
@@ -532,10 +722,7 @@ impl Application for AppModel {
                     };
                     match client.register_app("Toot".to_string(), &options).await {
                         Ok(app_data) => Message::StoreRegistration(Some(app_data)),
-                        Err(err) => {
-                            tracing::error!("{err}");
-                            Message::None
-                        }
+                        Err(err) => Message::Error(format!("Couldn't register with server: {err}")),
                     }
                 }));
             }
@@ -568,10 +755,7 @@ impl Application for AppModel {
                                 instance,
                                 Some(token.access_token),
                             )),
-                            Err(err) => {
-                                tracing::error!("{err}");
-                                Message::None
-                            }
+                            Err(err) => Message::Error(format!("Couldn't complete login: {err}")),
                         }
                     });
                     tasks.push(task);
@@ -588,14 +772,28 @@ impl Application for AppModel {
                             self.mastodon = mastodon;
                             self.update_navbar();
                             tasks.push(self.on_nav_select(self.nav.active()));
+                            tasks.push(fetch_session_info(self.mastodon.clone()));
                         }
-                        Err(err) => tracing::error!("{err}"),
+                        Err(err) => tasks.push(cosmic::task::message(Message::Error(format!(
+                            "Couldn't save session: {err}"
+                        )))),
                     },
-                    Err(err) => tracing::error!("{err}"),
+                    Err(err) => tasks.push(cosmic::task::message(Message::Error(format!(
+                        "Couldn't save session: {err}"
+                    )))),
                 }
             }
             Message::UpdateMastodonInstance => {
                 self.mastodon = Client::new(self.instance(), None);
+            }
+            Message::SetAccount(account) => {
+                self.cache.me = Some(account);
+            }
+            Message::SetMaxCharacters(max_characters) => {
+                self.max_characters = max_characters;
+            }
+            Message::StatusDeleted(id) => {
+                self.cache.statuses.remove(&id);
             }
             Message::Open(url) => {
                 if let Err(err) = open::that_detached(url) {
@@ -606,6 +804,25 @@ impl Application for AppModel {
                 if self.context_page == context_page {
                     self.core.window.show_context = !self.core.window.show_context;
                 } else {
+                    if let ContextPage::Account(account) = &context_page {
+                        if self.mastodon.is_authenticated() {
+                            let mastodon = self.mastodon.clone();
+                            let id = account.id.clone();
+                            tasks.push(cosmic::task::future(async move {
+                                match mastodon.get_relationships(vec![id]).await {
+                                    Ok(response) => response
+                                        .json
+                                        .into_iter()
+                                        .next()
+                                        .map(Message::CacheRelationship)
+                                        .unwrap_or(Message::None),
+                                    Err(err) => Message::Error(format!(
+                                        "Couldn't load relationship: {err}"
+                                    )),
+                                }
+                            }));
+                        }
+                    }
                     self.context_page = context_page;
                     self.core.window.show_context = true;
                 }
@@ -615,11 +832,11 @@ impl Application for AppModel {
             }
             Message::Dialog(action) => match action {
                 DialogAction::Open(dialog) => match dialog {
-                    Dialog::Reply(new_status) => {
-                        if let Some(status) = new_status.status.clone() {
-                            self.dialog_editor = widget::text_editor::Content::with_text(&status);
-                        }
-                        self.dialog_pages.push_back(Dialog::Reply(new_status))
+                    Dialog::Compose(state) => {
+                        self.dialog_editor = widget::text_editor::Content::with_text(
+                            state.text.as_deref().unwrap_or(""),
+                        );
+                        self.dialog_pages.push_back(Dialog::Compose(state))
                     }
                     _ => self.dialog_pages.push_back(dialog),
                 },
@@ -632,21 +849,19 @@ impl Application for AppModel {
                 DialogAction::Complete => {
                     if let Some(dialog_page) = self.dialog_pages.pop_front() {
                         match dialog_page {
-                            Dialog::Reply(mut new_status) => {
-                                new_status.status = Some(self.dialog_editor.text());
+                            Dialog::Compose(state) => {
+                                let text = self.dialog_editor.text();
                                 let mastodon = self.mastodon.clone();
                                 tasks.push(cosmic::task::future(async move {
                                     let options = PostStatusInputOptions {
-                                        in_reply_to_id: new_status.in_reply_to_id,
+                                        in_reply_to_id: state.in_reply_to_id,
+                                        spoiler_text: state
+                                            .content_warning
+                                            .then_some(state.spoiler_text),
+                                        visibility: Some(state.visibility),
                                         ..Default::default()
                                     };
-                                    match mastodon
-                                        .post_status(
-                                            new_status.status.unwrap_or_default(),
-                                            Some(&options),
-                                        )
-                                        .await
-                                    {
+                                    match mastodon.post_status(text, Some(&options)).await {
                                         Ok(response) => match response.json {
                                             megalodon::megalodon::PostStatusOutput::Status(
                                                 status,
@@ -655,9 +870,17 @@ impl Application for AppModel {
                                                 _,
                                             ) => Message::None,
                                         },
+                                        Err(err) => Message::Error(format!("Couldn't post: {err}")),
+                                    }
+                                }));
+                            }
+                            Dialog::DeleteStatus(id) => {
+                                let mastodon = self.mastodon.clone();
+                                tasks.push(cosmic::task::future(async move {
+                                    match mastodon.delete_status(id.clone()).await {
+                                        Ok(_) => Message::StatusDeleted(id),
                                         Err(err) => {
-                                            tracing::error!("{err}");
-                                            Message::None
+                                            Message::Error(format!("Couldn't delete post: {err}"))
                                         }
                                     }
                                 }));
@@ -681,6 +904,7 @@ impl Application for AppModel {
                             }
                             Dialog::Logout => {
                                 self.mastodon = Client::new(self.instance(), None);
+                                self.cache.clear();
                                 self.update_navbar();
                                 if let Err(err) =
                                     keytar::delete_password(Self::APP_ID, "mastodon-data")
@@ -697,6 +921,13 @@ impl Application for AppModel {
             }
             Message::UpdateConfig(config) => {
                 self.config = config;
+            }
+            Message::Error(message) => {
+                tracing::error!("{message}");
+                tasks.push(self.toasts.push(Toast::new(message)).map(cosmic::Action::App));
+            }
+            Message::CloseToast(id) => {
+                self.toasts.remove(id);
             }
             Message::None => (),
         }
@@ -797,24 +1028,58 @@ impl AppModel {
             )
     }
 
-    fn status(&self, id: &String) -> Element<'_, Message> {
-        let status = self.cache.statuses.get(&id.to_string()).map(|status| {
-            crate::widgets::status(
-                status,
-                StatusOptions::new(true, true, true, false),
-                &self.cache,
+    fn delete_status(&self, _id: String) -> widget::Dialog<'_, Message> {
+        widget::dialog()
+            .title(fl!("delete-status-question"))
+            .body(fl!("delete-status-description"))
+            .icon(widget::icon::from_name("user-trash-symbolic"))
+            .primary_action(
+                widget::button::destructive(fl!("delete"))
+                    .on_press(Message::Dialog(DialogAction::Complete)),
             )
-            .map(pages::home::Message::Status)
-            .map(Message::Home)
-            .apply(widget::container)
-            .class(cosmic::theme::Container::Dialog(false))
+            .secondary_action(
+                widget::button::standard(fl!("cancel"))
+                    .on_press(Message::Dialog(DialogAction::Close)),
+            )
+    }
+
+    fn status(&self, id: &String) -> Element<'_, Message> {
+        let status = self.cache.statuses.get(id).map(|status| {
+            status::status(status, StatusOptions::new(true, true, true, false), &self.cache)
+                .map(timeline::Message::Status)
+                .map(Message::Home)
+                .apply(widget::container)
+                .class(cosmic::theme::Container::Dialog(false))
         });
         widget::column![status].into()
     }
 
     fn account<'a>(&'a self, account: &'a Account) -> Element<'a, Message> {
-        crate::widgets::account(account, &self.cache.handles).map(Message::Account)
+        accounts::account(account, &self.cache).map(Message::Account)
     }
+}
+
+/// Fetch the authenticated account and the instance's status length limit,
+/// used to gate the compose dialog's delete action and character counter.
+fn fetch_session_info(mastodon: Client) -> Task<Message> {
+    let account_client = mastodon.clone();
+    let instance_client = mastodon;
+    Task::batch(vec![
+        cosmic::task::future(async move {
+            match account_client.verify_account_credentials().await {
+                Ok(response) => Message::SetAccount(response.json),
+                Err(err) => Message::Error(format!("Couldn't load account: {err}")),
+            }
+        }),
+        cosmic::task::future(async move {
+            match instance_client.get_instance().await {
+                Ok(response) => {
+                    Message::SetMaxCharacters(response.json.configuration.statuses.max_characters)
+                }
+                Err(err) => Message::Error(format!("Couldn't load instance info: {err}")),
+            }
+        }),
+    ])
 }
 
 fn instance(instance: impl Into<String>) -> String {

@@ -1,13 +1,16 @@
 use cosmic::{widget, Element};
 use megalodon::entities::{notification::NotificationType, Notification};
 
-use crate::utils::{self, Cache};
-
-use super::status::StatusOptions;
+use crate::cache::{self, Cache};
+use crate::features::status::{self, StatusOptions};
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Status(crate::widgets::status::Message),
+    Status(status::Message),
+    /// Accept a follow request: (notification id, requesting account id).
+    AcceptFollowRequest(String, String),
+    /// Reject a follow request: (notification id, requesting account id).
+    RejectFollowRequest(String, String),
 }
 
 pub fn notification<'a>(notification: &'a Notification, cache: &'a Cache) -> Element<'a, Message> {
@@ -54,7 +57,7 @@ pub fn notification<'a>(notification: &'a Notification, cache: &'a Cache) -> Ele
         .as_ref()
         .and_then(|account| cache.handles.get(&account.avatar))
         .map(|handle| widget::image(handle).width(20))
-        .unwrap_or_else(|| utils::fallback_avatar().width(20));
+        .unwrap_or_else(|| cache::fallback_avatar().width(20));
 
     let action = action.unwrap_or_else(|| "Unknown notification type".to_string());
 
@@ -62,21 +65,36 @@ pub fn notification<'a>(notification: &'a Notification, cache: &'a Cache) -> Ele
         widget::row![avatar_url, widget::text(action)].spacing(spacing.space_xs),
     )
     .on_press_maybe(notification.account.as_ref().map(|account| {
-        Message::Status(crate::widgets::status::Message::OpenAccount(
-            account.clone(),
-        ))
+        Message::Status(status::Message::OpenAccount(account.clone()))
     }));
 
-    let content = notification.status.as_ref().map(|status| {
+    let content = notification.status.as_ref().map(|status_data| {
         widget::container(
-            crate::widgets::status(status, StatusOptions::new(false, true, false, true), cache)
+            status::status(status_data, StatusOptions::new(false, true, false, true), cache)
                 .map(Message::Status),
         )
         .padding(spacing.space_xxs)
         .class(cosmic::theme::Container::Dialog(false))
     });
 
-    let content = widget::column![action, content].spacing(spacing.space_xs);
+    let follow_request_actions = (notification.r#type == NotificationType::FollowRequest)
+        .then_some(notification.account.as_ref())
+        .flatten()
+        .map(|account| {
+            widget::row![
+                widget::button::suggested("Accept").on_press(Message::AcceptFollowRequest(
+                    notification.id.clone(),
+                    account.id.clone(),
+                )),
+                widget::button::standard("Reject").on_press(Message::RejectFollowRequest(
+                    notification.id.clone(),
+                    account.id.clone(),
+                )),
+            ]
+            .spacing(spacing.space_xs)
+        });
+
+    let content = widget::column![action, follow_request_actions, content].spacing(spacing.space_xs);
 
     widget::settings::flex_item_row(vec![content.into()])
         .padding(spacing.space_xs)
