@@ -2,17 +2,15 @@ use std::collections::VecDeque;
 
 use cosmic::{
     app::Task,
+    iced::widget::scrollable::{Direction, Scrollbar},
     iced::{Length, Subscription},
-    iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,
 };
-use mastodon_async::{
-    entities::notification::Notification,
-    prelude::{Mastodon, NotificationId},
-};
+use megalodon::entities::Notification;
 
 use crate::{
     app,
+    mastodon::Client,
     utils::{self, Cache},
     widgets,
 };
@@ -21,13 +19,13 @@ use super::MastodonPage;
 
 #[derive(Debug, Clone)]
 pub struct Notifications {
-    pub mastodon: Mastodon,
-    notifications: VecDeque<NotificationId>,
+    pub mastodon: Client,
+    notifications: VecDeque<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    SetClient(Mastodon),
+    SetClient(Client),
     AppendNotification(Notification),
     PrependNotification(Notification),
     Notification(crate::widgets::notification::Message),
@@ -35,12 +33,12 @@ pub enum Message {
 
 impl MastodonPage for Notifications {
     fn is_authenticated(&self) -> bool {
-        !self.mastodon.data.token.is_empty()
+        self.mastodon.is_authenticated()
     }
 }
 
 impl Notifications {
-    pub fn new(mastodon: Mastodon) -> Self {
+    pub fn new(mastodon: Client) -> Self {
         Self {
             mastodon,
             notifications: VecDeque::new(),

@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod error;
 mod i18n;
+mod mastodon;
 mod pages;
 mod settings;
 mod subscriptions;

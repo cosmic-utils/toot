@@ -1,17 +1,16 @@
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use cosmic::{
-    iced_core::image,
+    iced::core::image,
     widget::{self, image::Handle},
 };
-use mastodon_async::prelude::*;
-use reqwest::Url;
+use megalodon::entities::{Notification, Status};
 
 use crate::error::Error;
 
 #[derive(Debug, Clone)]
 pub struct Cache {
-    pub handles: HashMap<Url, Handle>,
+    pub handles: HashMap<String, Handle>,
     pub statuses: HashMap<String, Status>,
     pub notifications: HashMap<String, Notification>,
 }
@@ -40,7 +39,7 @@ impl Cache {
         }
     }
 
-    pub fn insert_handle(&mut self, url: Url, handle: Handle) {
+    pub fn insert_handle(&mut self, url: String, handle: Handle) {
         self.handles.insert(url, handle);
     }
 
@@ -74,58 +73,76 @@ pub async fn get(url: impl ToString) -> Result<Handle, Error> {
     }
 }
 
-pub fn extract_status_images(status: &Status) -> Vec<Url> {
-    let mut urls = Vec::new();
-    urls.push(status.account.avatar.clone());
-    urls.push(status.account.header.clone());
+pub fn extract_status_images(status: &Status) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    if !status.account.avatar.is_empty() {
+        urls.push(status.account.avatar.clone());
+    }
+    if !status.account.header.is_empty() {
+        urls.push(status.account.header.clone());
+    }
 
     if let Some(reblog) = &status.reblog {
-        urls.push(reblog.account.avatar.clone());
-        urls.push(reblog.account.header.clone());
+        if !reblog.account.avatar.is_empty() {
+            urls.push(reblog.account.avatar.clone());
+        }
+        if !reblog.account.header.is_empty() {
+            urls.push(reblog.account.header.clone());
+        }
         if let Some(card) = &reblog.card {
             if let Some(image) = &card.image {
-                if let Ok(url) = Url::from_str(image) {
-                    urls.push(url);
-                }
+                urls.push(image.clone());
             }
         }
         for attachment in &reblog.media_attachments {
-            urls.push(attachment.preview_url.clone());
+            if let Some(url) = &attachment.preview_url {
+                urls.push(url.clone());
+            }
         }
     }
 
     if let Some(card) = &status.card {
         if let Some(image) = &card.image {
-            if let Ok(url) = Url::from_str(image) {
-                urls.push(url);
-            }
+            urls.push(image.clone());
         }
     }
 
     for attachment in &status.media_attachments {
-        urls.push(attachment.preview_url.clone());
+        if let Some(url) = &attachment.preview_url {
+            urls.push(url.clone());
+        }
     }
 
     urls
 }
 
-pub fn extract_notification_images(notification: &Notification) -> Vec<Url> {
-    let mut urls = Vec::new();
-    urls.push(notification.account.avatar.clone());
-    urls.push(notification.account.header.clone());
+pub fn extract_notification_images(notification: &Notification) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(account) = &notification.account {
+        if !account.avatar.is_empty() {
+            urls.push(account.avatar.clone());
+        }
+        if !account.header.is_empty() {
+            urls.push(account.header.clone());
+        }
+    }
 
     if let Some(status) = &notification.status {
-        urls.push(status.account.avatar.clone());
-        urls.push(status.account.header.clone());
+        if !status.account.avatar.is_empty() {
+            urls.push(status.account.avatar.clone());
+        }
+        if !status.account.header.is_empty() {
+            urls.push(status.account.header.clone());
+        }
         if let Some(card) = &status.card {
             if let Some(image) = &card.image {
-                if let Ok(url) = Url::from_str(image) {
-                    urls.push(url);
-                }
+                urls.push(image.clone());
             }
         }
         for attachment in &status.media_attachments {
-            urls.push(attachment.preview_url.clone());
+            if let Some(url) = &attachment.preview_url {
+                urls.push(url.clone());
+            }
         }
     }
     urls

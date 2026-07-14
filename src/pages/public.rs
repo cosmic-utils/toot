@@ -2,14 +2,15 @@ use std::collections::VecDeque;
 
 use cosmic::{
     app::Task,
+    iced::widget::scrollable::{Direction, Scrollbar},
     iced::{Length, Subscription},
-    iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,
 };
-use mastodon_async::prelude::{Mastodon, Status, StatusId};
+use megalodon::entities::Status;
 
 use crate::{
     app,
+    mastodon::Client,
     utils::Cache,
     widgets::{self, status::StatusOptions},
 };
@@ -18,8 +19,8 @@ use super::MastodonPage;
 
 #[derive(Debug, Clone)]
 pub struct Public {
-    pub mastodon: Mastodon,
-    statuses: VecDeque<StatusId>,
+    pub mastodon: Client,
+    statuses: VecDeque<String>,
     timeline: TimelineType,
 }
 
@@ -32,19 +33,19 @@ pub enum TimelineType {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    SetClient(Mastodon),
+    SetClient(Client),
     AppendStatus(Status),
     Status(crate::widgets::status::Message),
 }
 
 impl MastodonPage for Public {
     fn is_authenticated(&self) -> bool {
-        !self.mastodon.data.token.is_empty()
+        self.mastodon.is_authenticated()
     }
 }
 
 impl Public {
-    pub fn new(mastodon: Mastodon, timeline: TimelineType) -> Self {
+    pub fn new(mastodon: Client, timeline: TimelineType) -> Self {
         Self {
             mastodon,
             statuses: VecDeque::new(),

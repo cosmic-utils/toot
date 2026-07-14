@@ -29,8 +29,4 @@ impl TootConfig {
             None => TootConfig::default(),
         }
     }
-
-    pub fn url(&self) -> String {
-        format!("https://{}", self.server)
-    }
 }

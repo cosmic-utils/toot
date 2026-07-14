@@ -2,14 +2,15 @@ use std::collections::VecDeque;
 
 use cosmic::{
     app::Task,
+    iced::widget::scrollable::{Direction, Scrollbar},
     iced::{Length, Subscription},
-    iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,
 };
-use mastodon_async::prelude::{Mastodon, Status, StatusId};
+use megalodon::entities::Status;
 
 use crate::{
     app,
+    mastodon::Client,
     utils::{self, Cache},
     widgets::{self, status::StatusOptions},
 };
@@ -18,15 +19,15 @@ use super::MastodonPage;
 
 #[derive(Debug, Clone)]
 pub struct Home {
-    pub mastodon: Mastodon,
-    statuses: VecDeque<StatusId>,
-    skip: usize,
+    pub mastodon: Client,
+    statuses: VecDeque<String>,
+    max_id: Option<String>,
     loading: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    SetClient(Mastodon),
+    SetClient(Client),
     AppendStatus(Status),
     PrependStatus(Status),
     DeleteStatus(String),
@@ -36,16 +37,16 @@ pub enum Message {
 
 impl MastodonPage for Home {
     fn is_authenticated(&self) -> bool {
-        !self.mastodon.data.token.is_empty()
+        self.mastodon.is_authenticated()
     }
 }
 
 impl Home {
-    pub fn new(mastodon: Mastodon) -> Self {
+    pub fn new(mastodon: Client) -> Self {
         Self {
             mastodon,
             statuses: VecDeque::new(),
-            skip: 0,
+            max_id: None,
             loading: false,
         }
     }
@@ -81,11 +82,11 @@ impl Home {
             Message::LoadMore(load) => {
                 if !self.loading && load {
                     self.loading = true;
-                    self.skip += 20;
                 }
             }
             Message::AppendStatus(status) => {
                 self.loading = false;
+                self.max_id = Some(status.id.clone());
                 self.statuses.push_back(status.id.clone());
                 tasks.push(cosmic::task::message(app::Message::CacheStatus(
                     status.clone(),
@@ -109,12 +110,10 @@ impl Home {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        if self.is_authenticated()
-            && (self.statuses.is_empty() || self.statuses.len() != self.skip + 20)
-        {
+        if self.is_authenticated() && (self.statuses.is_empty() || self.loading) {
             Subscription::batch(vec![crate::subscriptions::home::user_timeline(
                 self.mastodon.clone(),
-                self.skip,
+                self.max_id.clone(),
             )])
         } else {
             Subscription::none()

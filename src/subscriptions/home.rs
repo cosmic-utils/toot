@@ -1,36 +1,36 @@
 use cosmic::iced::{stream, Subscription};
-use futures_util::{SinkExt, StreamExt};
-use mastodon_async::Mastodon;
+use futures_util::SinkExt;
+use megalodon::megalodon::GetHomeTimelineInputOptions;
 
-use crate::pages;
+use crate::{mastodon::Client, pages};
 
-pub fn user_timeline(mastodon: Mastodon, skip: usize) -> Subscription<pages::home::Message> {
-    Subscription::run_with_id(
-        format!("timeline-{}-{}", skip, mastodon.data.base),
-        stream::channel(1, move |mut output| async move {
-            println!("{}", format!("timeline-{}-{}", skip, mastodon.data.base));
+pub fn user_timeline(mastodon: Client, max_id: Option<String>) -> Subscription<pages::home::Message> {
+    Subscription::run_with((mastodon, max_id), |(mastodon, max_id)| {
+        let mastodon = mastodon.clone();
+        let max_id = max_id.clone();
+        stream::channel(1, move |mut output: futures_channel::mpsc::Sender<pages::home::Message>| async move {
+            let options = GetHomeTimelineInputOptions {
+                max_id,
+                ..Default::default()
+            };
 
-            // First fetch the timeline
-            let mut stream = Box::pin(
-                mastodon
-                    .get_home_timeline()
-                    .await
-                    .unwrap()
-                    .items_iter()
-                    .skip(skip)
-                    .take(20),
-            );
-
-            while let Some(status) = stream.next().await {
-                if let Err(err) = output
-                    .send(pages::home::Message::AppendStatus(status.clone()))
-                    .await
-                {
-                    tracing::warn!("failed to send post: {}", err);
+            match mastodon.get_home_timeline(Some(&options)).await {
+                Ok(response) => {
+                    for status in response.json {
+                        if let Err(err) = output
+                            .send(pages::home::Message::AppendStatus(status.clone()))
+                            .await
+                        {
+                            tracing::warn!("failed to send post: {}", err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("failed to get home timeline: {}", err);
                 }
             }
 
             std::future::pending().await
-        }),
-    )
+        })
+    })
 }

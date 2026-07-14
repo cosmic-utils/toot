@@ -1,16 +1,10 @@
-use std::str::FromStr;
-
 use cosmic::{
     app::Task,
+    iced::widget::scrollable::{Direction, Scrollbar},
     iced::{mouse::Interaction, Alignment, Length},
-    iced_widget::scrollable::{Direction, Scrollbar},
     widget, Apply, Element,
 };
-use mastodon_async::{
-    prelude::{Account, Status, StatusId},
-    NewStatus,
-};
-use reqwest::Url;
+use megalodon::entities::{Account, Status};
 
 use crate::{
     app,
@@ -20,11 +14,11 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenAccount(Account),
-    ExpandStatus(StatusId),
-    Reply(StatusId, String),
-    Favorite(StatusId, bool),
-    Boost(StatusId, bool),
-    OpenLink(Url),
+    ExpandStatus(String),
+    Reply(String, String),
+    Favorite(String, bool),
+    Boost(String, bool),
+    OpenLink(String),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -67,49 +61,47 @@ pub fn status<'a>(
         .map(|reblog| cache.statuses.get(&reblog.id.to_string()).unwrap_or(reblog))
         .unwrap_or(status);
 
-    widget::column()
-        .push_maybe(reblog_button)
-        .push(header(status, cache))
-        .push(content(status, options))
-        .push_maybe(card(status, cache))
-        .push_maybe(media(status, cache, options))
-        .push_maybe(tags(status, options))
-        .push_maybe(actions(status, options))
-        .padding(spacing.space_xs)
-        .spacing(spacing.space_xs)
-        .width(Length::Fill)
-        .into()
+    widget::column![
+        reblog_button,
+        header(status, cache),
+        content(status, options),
+        card(status, cache),
+        media(status, cache, options),
+        tags(status, options),
+        actions(status, options),
+    ]
+    .padding(spacing.space_xs)
+    .spacing(spacing.space_xs)
+    .width(Length::Fill)
+    .into()
 }
 
 fn card<'a>(status: &'a Status, cache: &'a Cache) -> Option<Element<'a, Message>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
     status.card.as_ref().map(|card| {
-        widget::column()
-            .push_maybe(card.image.as_ref().map(|image| {
-                Url::from_str(image)
-                    .ok()
-                    .map(|url| {
-                        cache
-                            .handles
-                            .get(&url)
-                            .map(widget::image)
-                            .unwrap_or(utils::fallback_avatar())
-                    })
-                    .unwrap_or(utils::fallback_avatar())
-            }))
-            .push(
-                widget::column()
-                    .push(widget::text::title4(&card.title))
-                    .push(widget::text(&card.description))
-                    .spacing(spacing.space_xs)
-                    .padding(spacing.space_xs),
-            )
-            .apply(widget::container)
-            .class(cosmic::style::Container::Dialog)
-            .apply(widget::button::custom)
-            .class(cosmic::style::Button::Image)
-            .on_press(Message::OpenLink(card.url.clone()))
-            .into()
+        let avatar = card.image.as_ref().map(|image| {
+            cache
+                .handles
+                .get(image)
+                .map(widget::image)
+                .unwrap_or(utils::fallback_avatar())
+        });
+
+        widget::column![
+            avatar,
+            widget::column![
+                widget::text::title4(&card.title),
+                widget::text(&card.description),
+            ]
+            .spacing(spacing.space_xs)
+            .padding(spacing.space_xs),
+        ]
+        .apply(widget::container)
+        .class(cosmic::style::Container::Dialog(false))
+        .apply(widget::button::custom)
+        .class(cosmic::style::Button::Image)
+        .on_press(Message::OpenLink(card.url.clone()))
+        .into()
     })
 }
 
@@ -122,7 +114,7 @@ pub fn update(message: Message) -> Task<app::Message> {
             app::ContextPage::Status(id),
         )),
         Message::Reply(status_id, username) => {
-            let new_status = NewStatus {
+            let new_status = app::NewStatus {
                 in_reply_to_id: Some(status_id.to_string()),
                 status: Some(format!("@{} ", username)),
                 ..Default::default()
@@ -145,59 +137,54 @@ fn actions(status: &Status, options: StatusOptions) -> Option<Element<'_, Messag
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let actions = (options.actions).then_some({
-        widget::row()
-            .push(
-                widget::button::icon(widget::icon::from_name("mail-replied-symbolic"))
-                    .label(status.replies_count.to_string())
-                    .on_press(Message::Reply(
-                        status.id.clone(),
-                        status.account.username.clone(),
-                    )),
-            )
-            .push(
-                widget::button::icon(widget::icon::from_name("emblem-shared-symbolic"))
-                    .label(status.reblogs_count.to_string())
-                    .class(
-                        status
-                            .reblogged
-                            .map(|reblogged| {
-                                if reblogged {
-                                    cosmic::theme::Button::Suggested
-                                } else {
-                                    cosmic::theme::Button::Icon
-                                }
-                            })
-                            .unwrap_or(cosmic::theme::Button::Icon),
-                    )
-                    .on_press_maybe(
-                        status
-                            .reblogged
-                            .map(|reblogged| Message::Boost(status.id.clone(), reblogged)),
-                    ),
-            )
-            .push(
-                widget::button::icon(widget::icon::from_name("starred-symbolic"))
-                    .label(status.favourites_count.to_string())
-                    .class(
-                        status
-                            .favourited
-                            .map(|favourited| {
-                                if favourited {
-                                    cosmic::theme::Button::Suggested
-                                } else {
-                                    cosmic::theme::Button::Icon
-                                }
-                            })
-                            .unwrap_or(cosmic::theme::Button::Icon),
-                    )
-                    .on_press_maybe(
-                        status
-                            .favourited
-                            .map(|favourited| Message::Favorite(status.id.clone(), favourited)),
-                    ),
-            )
-            .spacing(spacing.space_xs)
-            .into()
+        widget::row![
+            widget::button::icon(widget::icon::from_name("mail-replied-symbolic"))
+                .label(status.replies_count.to_string())
+                .on_press(Message::Reply(
+                    status.id.clone(),
+                    status.account.username.clone(),
+                )),
+            widget::button::icon(widget::icon::from_name("emblem-shared-symbolic"))
+                .label(status.reblogs_count.to_string())
+                .class(
+                    status
+                        .reblogged
+                        .map(|reblogged| {
+                            if reblogged {
+                                cosmic::theme::Button::Suggested
+                            } else {
+                                cosmic::theme::Button::Icon
+                            }
+                        })
+                        .unwrap_or(cosmic::theme::Button::Icon),
+                )
+                .on_press_maybe(
+                    status
+                        .reblogged
+                        .map(|reblogged| Message::Boost(status.id.clone(), reblogged)),
+                ),
+            widget::button::icon(widget::icon::from_name("starred-symbolic"))
+                .label(status.favourites_count.to_string())
+                .class(
+                    status
+                        .favourited
+                        .map(|favourited| {
+                            if favourited {
+                                cosmic::theme::Button::Suggested
+                            } else {
+                                cosmic::theme::Button::Icon
+                            }
+                        })
+                        .unwrap_or(cosmic::theme::Button::Icon),
+                )
+                .on_press_maybe(
+                    status
+                        .favourited
+                        .map(|favourited| Message::Favorite(status.id.clone(), favourited)),
+                ),
+        ]
+        .spacing(spacing.space_xs)
+        .into()
     });
     actions
 }
@@ -206,7 +193,7 @@ fn media<'a>(
     status: &'a Status,
     cache: &'a Cache,
     options: StatusOptions,
-) -> Option<cosmic::iced_widget::Scrollable<'a, Message, cosmic::Theme>> {
+) -> Option<cosmic::iced::widget::Scrollable<'a, Message, cosmic::Theme>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let attachments = status
@@ -214,19 +201,20 @@ fn media<'a>(
         .iter()
         .map(|media| {
             widget::button::image(
-                cache
-                    .handles
-                    .get(&media.preview_url)
+                media
+                    .preview_url
+                    .as_ref()
+                    .and_then(|url| cache.handles.get(url))
                     .cloned()
                     .unwrap_or(crate::utils::fallback_handle()),
             )
-            .on_press_maybe(media.url.as_ref().cloned().map(Message::OpenLink))
+            .on_press(Message::OpenLink(media.url.clone()))
             .into()
         })
         .collect::<Vec<Element<Message>>>();
 
     let media = (!status.media_attachments.is_empty() && options.media).then_some({
-        widget::scrollable(widget::row().extend(attachments).spacing(spacing.space_xxs))
+        widget::scrollable(widget::row(attachments).spacing(spacing.space_xxs))
             .direction(Direction::Horizontal(Scrollbar::new()))
     });
     media
@@ -236,20 +224,16 @@ fn tags(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>>
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let tags: Option<Element<_>> = (!status.tags.is_empty() && options.tags).then(|| {
-        widget::row()
-            .spacing(spacing.space_xxs)
-            .extend(
-                status
-                    .tags
-                    .iter()
-                    .map(|tag| {
-                        widget::button::suggested(format!("#{}", tag.name.clone()))
-                            .on_press_maybe(Url::from_str(&tag.url).map(Message::OpenLink).ok())
-                            .into()
-                    })
-                    .collect::<Vec<Element<Message>>>(),
-            )
-            .into()
+        let tags = status
+            .tags
+            .iter()
+            .map(|tag| {
+                widget::button::suggested(format!("#{}", tag.name.clone()))
+                    .on_press(Message::OpenLink(tag.url.clone()))
+                    .into()
+            })
+            .collect::<Vec<Element<Message>>>();
+        widget::row(tags).spacing(spacing.space_xxs).into()
     });
     tags
 }
@@ -257,32 +241,30 @@ fn tags(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>>
 fn header<'a>(
     status: &'a Status,
     cache: &'a Cache,
-) -> cosmic::iced_widget::Row<'a, Message, cosmic::Theme> {
+) -> cosmic::widget::Row<'a, Message, cosmic::Theme> {
     let spacing = cosmic::theme::active().cosmic().spacing;
 
-    let header = widget::row()
-        .push(
-            widget::button::image(
-                cache
-                    .handles
-                    .get(&status.account.avatar)
-                    .cloned()
-                    .unwrap_or(crate::utils::fallback_handle()),
-            )
-            .width(50)
-            .height(50)
-            .on_press(Message::OpenAccount(status.account.clone())),
+    let header = widget::row![
+        widget::button::image(
+            cache
+                .handles
+                .get(&status.account.avatar)
+                .cloned()
+                .unwrap_or(crate::utils::fallback_handle()),
         )
-        .push(
-            widget::column()
-                .push(widget::text(status.account.display_name.clone()).size(18))
-                .push(
-                    widget::button::link(format!("@{}", status.account.username.clone()))
-                        .on_press(Message::OpenAccount(status.account.clone())),
-                ),
-        )
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xs);
+        .width(50)
+        .height(50)
+        .on_press(Message::OpenAccount(status.account.clone())),
+        widget::column![
+            widget::text(status.account.display_name.clone()).size(18),
+            widget::button::link(format!("@{}", status.account.username.clone()))
+                .on_press(Message::OpenAccount(status.account.clone())),
+        ]
+        .align_x(Alignment::Center)
+        .spacing(spacing.space_xs),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(spacing.space_xs);
     header
 }
 
@@ -308,19 +290,15 @@ fn reblog_button<'a>(cache: &'a Cache, status: &'a Status) -> Option<widget::But
 
     (status.reblog.is_some()).then_some(
         widget::button::custom(
-            widget::row()
-                .push(
-                    cache
-                        .handles
-                        .get(&status.account.avatar)
-                        .map(|avatar| widget::image(avatar).width(20).height(20))
-                        .unwrap_or(crate::utils::fallback_avatar().width(20).height(20)),
-                )
-                .push(widget::text(format!(
-                    "{} boosted",
-                    status.account.display_name
-                )))
-                .spacing(spacing.space_xs),
+            widget::row![
+                cache
+                    .handles
+                    .get(&status.account.avatar)
+                    .map(|avatar| widget::image(avatar).width(20).height(20))
+                    .unwrap_or(crate::utils::fallback_avatar().width(20).height(20)),
+                widget::text(format!("{} boosted", status.account.display_name)),
+            ]
+            .spacing(spacing.space_xs),
         )
         .on_press(Message::OpenAccount(status.account.clone())),
     )

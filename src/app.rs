@@ -15,13 +15,13 @@ use cosmic::widget::image::Handle;
 use cosmic::widget::menu::{ItemHeight, ItemWidth};
 use cosmic::widget::{self, menu, nav_bar};
 use cosmic::{Application, ApplicationExt, Apply, Element};
-use mastodon_async::helpers::toml;
-use mastodon_async::prelude::{Account, Notification, Scopes, Status, StatusId};
-use mastodon_async::registration::Registered;
-use mastodon_async::{Data, Mastodon, NewStatus, Registration};
-use reqwest::Url;
+use megalodon::entities::{Account, Notification, Status};
+use megalodon::megalodon::PostStatusInputOptions;
+use megalodon::oauth::AppData;
+
 use std::collections::{HashMap, VecDeque};
-use std::str::FromStr;
+
+use crate::mastodon::{Client, Session};
 
 const REPOSITORY: &str = "https://github.com/edfloreshz/toot";
 const SUPPORT: &str = "https://github.com/edfloreshz/toot/issues";
@@ -38,8 +38,8 @@ pub struct AppModel {
     handler: Option<cosmic_config::Config>,
     instance: String,
     code: String,
-    registration: Option<Registered>,
-    mastodon: Mastodon,
+    registration: Option<AppData>,
+    mastodon: Client,
     cache: Cache,
     home: pages::home::Home,
     notifications: pages::notifications::Notifications,
@@ -57,8 +57,8 @@ pub enum Message {
     InstanceEdit,
     RegisterMastodonClient,
     CompleteRegistration,
-    StoreMastodonData(Mastodon),
-    StoreRegistration(Option<Registered>),
+    StoreMastodonData(Client),
+    StoreRegistration(Option<AppData>),
     Home(pages::home::Message),
     Notifications(pages::notifications::Message),
     Explore(pages::public::Message),
@@ -66,10 +66,10 @@ pub enum Message {
     Federated(pages::public::Message),
     Account(widgets::account::Message),
     Status(widgets::status::Message),
-    Fetch(Vec<Url>),
+    Fetch(Vec<String>),
     CacheStatus(Status),
     CacheNotification(Notification),
-    CacheHandle(Url, Handle),
+    CacheHandle(String, Handle),
     Dialog(DialogAction),
     EditorAction(widget::text_editor::Action),
     UpdateMastodonInstance,
@@ -82,6 +82,12 @@ pub enum DialogAction {
     Update(Dialog),
     Close,
     Complete,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewStatus {
+    pub in_reply_to_id: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,30 +124,21 @@ impl Application for AppModel {
         let instance = instance(flags.config.server.clone());
 
         let mastodon = match keytar::get_password(Self::APP_ID, "mastodon-data") {
-            Ok(data) => {
-                if data.success {
-                    let data: Data = toml::from_str(&data.password).unwrap();
-                    Mastodon::from(data)
-                } else {
-                    Mastodon::from(Data {
-                        base: instance.into(),
-                        ..Default::default()
-                    })
+            Ok(data) if data.success => match serde_json::from_str::<Session>(&data.password) {
+                Ok(session) => Client::new(session.base_url, Some(session.token)),
+                Err(err) => {
+                    tracing::error!("{err}");
+                    Client::new(instance.clone(), None)
                 }
-            }
+            },
+            Ok(_) => Client::new(instance.clone(), None),
             Err(err) => {
                 tracing::error!("{err}");
-                Mastodon::from(Data {
-                    base: instance.into(),
-                    ..Default::default()
-                })
+                Client::new(instance.clone(), None)
             }
         };
 
-        let variants = mastodon
-            .data
-            .token
-            .is_empty()
+        let variants = (!mastodon.is_authenticated())
             .then(Page::public_variants)
             .unwrap_or_else(Page::variants);
 
@@ -220,7 +217,7 @@ impl Application for AppModel {
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        if self.mastodon.data.token.is_empty() {
+        if !self.mastodon.is_authenticated() {
             vec![
                 // widget::icon::from_name("network-server-symbolic")
                 //     .apply(widget::button::icon)
@@ -314,29 +311,22 @@ impl Application for AppModel {
                 .control(
                     widget::container(
                         widget::scrollable(
-                            widget::column()
-                                .push_maybe(
-                                    self.cache
-                                        .statuses
-                                        .get(&new_status.in_reply_to_id.clone().unwrap())
-                                        .map(|status| {
-                                            widgets::status(
-                                                status,
-                                                StatusOptions::none(),
-                                                &self.cache,
-                                            )
+                            widget::column![
+                                self.cache
+                                    .statuses
+                                    .get(&new_status.in_reply_to_id.clone().unwrap())
+                                    .map(|status| {
+                                        widgets::status(status, StatusOptions::none(), &self.cache)
                                             .map(Message::Status)
                                             .apply(widget::container)
                                             .class(cosmic::style::Container::Card)
-                                        }),
-                                )
-                                .push(
-                                    widget::text_editor(&self.dialog_editor)
-                                        .height(200.)
-                                        .padding(spacing.space_s)
-                                        .on_action(Message::EditorAction),
-                                )
-                                .spacing(spacing.space_xs),
+                                    }),
+                                widget::text_editor(&self.dialog_editor)
+                                    .height(200.)
+                                    .padding(spacing.space_s)
+                                    .on_action(Message::EditorAction),
+                            ]
+                            .spacing(spacing.space_xs),
                         )
                         .width(Length::Fill),
                     )
@@ -423,7 +413,7 @@ impl Application for AppModel {
             None => (),
         };
 
-        if !self.mastodon.data.token.is_empty() {
+        if self.mastodon.is_authenticated() {
             subscriptions.push(crate::subscriptions::stream_user_events(
                 self.mastodon.clone(),
             ));
@@ -456,12 +446,12 @@ impl Application for AppModel {
                     let mastodon = self.mastodon.clone();
                     tasks.push(cosmic::task::future(async move {
                         let result = if favorited {
-                            mastodon.unfavourite(&status_id).await
+                            mastodon.unfavourite_status(status_id).await
                         } else {
-                            mastodon.favourite(&status_id).await
+                            mastodon.favourite_status(status_id).await
                         };
                         match result {
-                            Ok(status) => Message::CacheStatus(status),
+                            Ok(response) => Message::CacheStatus(response.json),
                             Err(err) => {
                                 tracing::error!("{err}");
                                 Message::None
@@ -473,12 +463,12 @@ impl Application for AppModel {
                     let mastodon = self.mastodon.clone();
                     tasks.push(cosmic::task::future(async move {
                         let result = if boosted {
-                            mastodon.unreblog(&status_id).await
+                            mastodon.unreblog_status(status_id).await
                         } else {
-                            mastodon.reblog(&status_id).await
+                            mastodon.reblog_status(status_id).await
                         };
                         match result {
-                            Ok(status) => Message::CacheStatus(status),
+                            Ok(response) => Message::CacheStatus(response.json),
                             Err(err) => {
                                 tracing::error!("{err}");
                                 Message::None
@@ -522,24 +512,26 @@ impl Application for AppModel {
             Message::InstanceEdit => {
                 let instance = self.instance.clone();
                 if let Some(ref handler) = self.handler {
-                    match self.config.set_server(handler, instance) {
-                        Ok(true) => (),
-                        Ok(false) => tracing::error!("Failed to write config"),
-                        Err(err) => tracing::error!("{err}"),
+                    if let Err(err) = self.config.set_server(handler, instance) {
+                        tracing::error!("{err}")
                     }
                 }
             }
             Message::RegisterMastodonClient => {
-                let mut registration = Registration::new(self.config.url());
+                let instance = self.instance();
                 tasks.push(cosmic::task::future(async move {
-                    let scopes = Scopes::from_str("read write").unwrap();
-                    match registration
-                        .client_name("Toot")
-                        .scopes(scopes)
-                        .build()
-                        .await
-                    {
-                        Ok(registration) => Message::StoreRegistration(Some(registration)),
+                    let client = Client::new(instance, None);
+                    let options = megalodon::megalodon::AppInputOptions {
+                        scopes: Some(
+                            ["read", "write", "follow"]
+                                .into_iter()
+                                .map(String::from)
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    };
+                    match client.register_app("Toot".to_string(), &options).await {
+                        Ok(app_data) => Message::StoreRegistration(Some(app_data)),
                         Err(err) => {
                             tracing::error!("{err}");
                             Message::None
@@ -549,7 +541,7 @@ impl Application for AppModel {
             }
             Message::StoreRegistration(registration) => {
                 if let Some(ref registration) = registration {
-                    if let Ok(url) = registration.authorize_url() {
+                    if let Some(url) = registration.url.clone() {
                         if let Err(err) = open::that_detached(url) {
                             tracing::error!("{err}");
                         }
@@ -560,9 +552,22 @@ impl Application for AppModel {
             Message::CompleteRegistration => {
                 if let Some(registration) = self.registration.take() {
                     let code = self.code.clone();
+                    let instance = self.instance();
                     let task = cosmic::task::future(async move {
-                        match registration.complete(code).await {
-                            Ok(mastodon) => Message::StoreMastodonData(mastodon),
+                        let client = Client::new(instance.clone(), None);
+                        match client
+                            .fetch_access_token(
+                                registration.client_id,
+                                registration.client_secret,
+                                code,
+                                megalodon::default::NO_REDIRECT.to_string(),
+                            )
+                            .await
+                        {
+                            Ok(token) => Message::StoreMastodonData(Client::new(
+                                instance,
+                                Some(token.access_token),
+                            )),
                             Err(err) => {
                                 tracing::error!("{err}");
                                 Message::None
@@ -573,21 +578,24 @@ impl Application for AppModel {
                 }
             }
             Message::StoreMastodonData(mastodon) => {
-                let data = &toml::to_string(&mastodon.data).unwrap();
-                match keytar::set_password(Self::APP_ID, "mastodon-data", data) {
-                    Ok(_) => {
-                        self.mastodon = mastodon;
-                        self.update_navbar();
-                        tasks.push(self.on_nav_select(self.nav.active()));
-                    }
+                let session = Session {
+                    base_url: mastodon.base_url.clone(),
+                    token: mastodon.token.clone().unwrap_or_default(),
+                };
+                match serde_json::to_string(&session) {
+                    Ok(data) => match keytar::set_password(Self::APP_ID, "mastodon-data", &data) {
+                        Ok(_) => {
+                            self.mastodon = mastodon;
+                            self.update_navbar();
+                            tasks.push(self.on_nav_select(self.nav.active()));
+                        }
+                        Err(err) => tracing::error!("{err}"),
+                    },
                     Err(err) => tracing::error!("{err}"),
                 }
             }
             Message::UpdateMastodonInstance => {
-                self.mastodon = Mastodon::from(Data {
-                    base: self.instance().clone().into(),
-                    ..Default::default()
-                });
+                self.mastodon = Client::new(self.instance(), None);
             }
             Message::Open(url) => {
                 if let Err(err) = open::that_detached(url) {
@@ -628,8 +636,25 @@ impl Application for AppModel {
                                 new_status.status = Some(self.dialog_editor.text());
                                 let mastodon = self.mastodon.clone();
                                 tasks.push(cosmic::task::future(async move {
-                                    match mastodon.new_status(new_status).await {
-                                        Ok(status) => Message::CacheStatus(status),
+                                    let options = PostStatusInputOptions {
+                                        in_reply_to_id: new_status.in_reply_to_id,
+                                        ..Default::default()
+                                    };
+                                    match mastodon
+                                        .post_status(
+                                            new_status.status.unwrap_or_default(),
+                                            Some(&options),
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => match response.json {
+                                            megalodon::megalodon::PostStatusOutput::Status(
+                                                status,
+                                            ) => Message::CacheStatus(status),
+                                            megalodon::megalodon::PostStatusOutput::ScheduledStatus(
+                                                _,
+                                            ) => Message::None,
+                                        },
                                         Err(err) => {
                                             tracing::error!("{err}");
                                             Message::None
@@ -655,10 +680,7 @@ impl Application for AppModel {
                                 tasks.push(self.update(Message::CompleteRegistration))
                             }
                             Dialog::Logout => {
-                                self.mastodon = Mastodon::from(Data {
-                                    base: self.instance().into(),
-                                    ..Default::default()
-                                });
+                                self.mastodon = Client::new(self.instance(), None);
                                 self.update_navbar();
                                 if let Err(err) =
                                     keytar::delete_password(Self::APP_ID, "mastodon-data")
@@ -775,7 +797,7 @@ impl AppModel {
             )
     }
 
-    fn status(&self, id: &StatusId) -> Element<'_, Message> {
+    fn status(&self, id: &String) -> Element<'_, Message> {
         let status = self.cache.statuses.get(&id.to_string()).map(|status| {
             crate::widgets::status(
                 status,
@@ -785,9 +807,9 @@ impl AppModel {
             .map(pages::home::Message::Status)
             .map(Message::Home)
             .apply(widget::container)
-            .class(cosmic::theme::Container::Dialog)
+            .class(cosmic::theme::Container::Dialog(false))
         });
-        widget::column().push_maybe(status).into()
+        widget::column![status].into()
     }
 
     fn account<'a>(&'a self, account: &'a Account) -> Element<'a, Message> {
@@ -797,10 +819,16 @@ impl AppModel {
 
 fn instance(instance: impl Into<String>) -> String {
     let instance: String = instance.into();
-    instance
-        .is_empty()
-        .then(|| format!("https://{}", "mastodon.social"))
-        .unwrap_or(format!("https://{}", instance))
+    let instance = instance
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    if instance.is_empty() {
+        format!("https://{}", "mastodon.social")
+    } else {
+        format!("https://{}", instance)
+    }
 }
 
 impl AppModel
@@ -814,11 +842,7 @@ where
     fn update_navbar(&mut self) {
         self.nav.clear();
 
-        let variants = self
-            .mastodon
-            .data
-            .token
-            .is_empty()
+        let variants = (!self.mastodon.is_authenticated())
             .then(Page::public_variants)
             .unwrap_or_else(Page::variants);
 
@@ -839,7 +863,7 @@ pub enum ContextPage {
     #[default]
     About,
     Account(Account),
-    Status(StatusId),
+    Status(String),
 }
 
 impl ContextPage {
