@@ -6,6 +6,7 @@ repository = "https://github.com/edfloreshz/toot"
 
 [dependencies]
 capitalize = "0.3.4"
+dirs = "6.0"
 futures-channel = "0.3.31"
 futures-util = "0.3.31"
 html2text = "0.13.4"
@@ -18,6 +19,10 @@ thiserror = "2.0.3"
 time = "0.3.36"
 tracing = "0.1.40"
 megalodon = "1.3.0"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt"]
 
 [dependencies.serde]
 version = "1.0.215"

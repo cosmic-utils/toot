@@ -32,6 +32,9 @@ pub fn timeline(mastodon: Client, max_id: Option<String>) -> Subscription<Messag
                     tracing::warn!("failed to get notifications: {}", err);
                 }
             }
+            if let Err(err) = output.send(Message::LoadComplete).await {
+                tracing::warn!("failed to send load-complete: {}", err);
+            }
 
             std::future::pending().await
         })

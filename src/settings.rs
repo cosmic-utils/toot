@@ -17,7 +17,10 @@ pub fn init() {
 }
 
 pub fn settings() -> Settings {
-    Settings::default().size_limits(Limits::NONE.min_width(360.0).min_height(180.0))
+    let theme = TootConfig::config().theme_mode.theme();
+    Settings::default()
+        .size_limits(Limits::NONE.min_width(360.0).min_height(180.0))
+        .theme(theme)
 }
 
 pub fn flags() -> Flags {

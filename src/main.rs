@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod features;
 mod i18n;
+mod persistence;
 mod settings;
 mod streaming;
 

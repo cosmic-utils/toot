@@ -1004,6 +1004,7 @@ version = "0.1.0"
 dependencies = [
  "capitalize",
  "chrono",
+ "dirs",
  "futures-channel",
  "futures-util",
  "html2text",
@@ -1019,6 +1020,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

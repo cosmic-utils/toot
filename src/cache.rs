@@ -6,6 +6,7 @@ use cosmic::{
 };
 use megalodon::entities::{Account, Notification, Relationship, Status};
 
+use crate::config::FeedDensity;
 use crate::error::Error;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,10 @@ pub struct Cache {
     /// `view(&Cache)` call.
     pub hide_boosts: bool,
     pub hide_replies: bool,
+    pub feed_density: FeedDensity,
+    /// Set whenever new content is cached; cleared once flushed to disk.
+    /// Lets the periodic save subscription skip writing when nothing changed.
+    pub dirty: bool,
 }
 
 impl Cache {
@@ -37,6 +42,8 @@ impl Cache {
             me: None,
             hide_boosts: false,
             hide_replies: false,
+            feed_density: FeedDensity::default(),
+            dirty: false,
         }
     }
 
@@ -61,6 +68,7 @@ impl Cache {
         if let Some(reblog) = status.reblog {
             self.statuses.insert(reblog.id.to_string(), *reblog);
         }
+        self.dirty = true;
     }
 
     pub fn insert_notification(&mut self, notification: Notification) {
@@ -69,6 +77,7 @@ impl Cache {
         if let Some(status) = notification.status {
             self.insert_status(status.clone());
         }
+        self.dirty = true;
     }
 
     pub fn insert_handle(&mut self, url: String, handle: Handle) {
@@ -81,6 +90,7 @@ impl Cache {
         self.handles.clear();
         self.relationships.clear();
         self.me = None;
+        self.dirty = false;
     }
 }
 
@@ -95,15 +105,35 @@ pub fn fallback_handle() -> widget::image::Handle {
 }
 
 pub async fn get(url: impl ToString) -> Result<Handle, Error> {
-    let response = reqwest::get(url.to_string()).await?;
+    let url = url.to_string();
+
+    if let Some(bytes) = load_cached_image(url.clone()).await {
+        return Ok(Handle::from_bytes(bytes));
+    }
+
+    let response = reqwest::get(&url).await?;
     match response.error_for_status() {
         Ok(response) => {
-            let bytes = response.bytes().await?;
-            let handle = Handle::from_bytes(bytes.to_vec());
-            Ok(handle)
+            let bytes = response.bytes().await?.to_vec();
+            save_cached_image(url, bytes.clone());
+            Ok(Handle::from_bytes(bytes))
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// Disk reads/writes are blocking; run them on tokio's blocking pool so a
+/// cold or growing image cache doesn't stall the async executor (and with
+/// it, every other in-flight fetch) one file at a time.
+async fn load_cached_image(url: String) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || crate::persistence::load_image(&url))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn save_cached_image(url: String, bytes: Vec<u8>) {
+    tokio::task::spawn_blocking(move || crate::persistence::save_image(&url, &bytes));
 }
 
 pub fn extract_status_images(status: &Status) -> Vec<String> {

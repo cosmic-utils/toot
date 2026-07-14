@@ -22,6 +22,7 @@ pub struct Notifications {
     notifications: VecDeque<String>,
     max_id: Option<String>,
     loading: bool,
+    has_loaded: bool,
     filter: Option<NotificationType>,
 }
 
@@ -34,6 +35,8 @@ pub enum Message {
     LoadMore(bool),
     SetFilter(Option<NotificationType>),
     ClearAll,
+    /// A fetch's result stream has ended (successfully, even if empty).
+    LoadComplete,
 }
 
 const FILTERS: [Option<NotificationType>; 5] = [
@@ -62,6 +65,7 @@ impl Notifications {
             notifications: VecDeque::new(),
             max_id: None,
             loading: false,
+            has_loaded: false,
             filter: None,
         }
     }
@@ -70,8 +74,61 @@ impl Notifications {
         self.mastodon.is_authenticated()
     }
 
+    /// Switch to a different account's client and drop this feed's current
+    /// content. Call [`Notifications::load_cached`] afterward to repopulate
+    /// from disk.
+    pub fn reset(&mut self, mastodon: Client) {
+        self.mastodon = mastodon;
+        self.notifications.clear();
+        self.max_id = None;
+        self.loading = false;
+        self.has_loaded = false;
+    }
+
+    /// Whether the initial fetch is still in flight (no content yet, and no
+    /// fetch has completed to confirm the feed is genuinely empty).
+    pub fn is_initial_loading(&self) -> bool {
+        self.notifications.is_empty() && !self.has_loaded
+    }
+
+    /// Load the last-saved notification snapshot from disk (if any) so the
+    /// view has something to render immediately, before the network fetch lands.
+    pub fn load_cached(&mut self) -> Task<app::Message> {
+        let cached: Vec<Notification> =
+            crate::persistence::load_snapshot(&self.mastodon.base_url, "notifications");
+        let mut tasks = vec![];
+        for notification in cached {
+            if !self.notifications.contains(&notification.id) {
+                self.notifications.push_back(notification.id.clone());
+            }
+            tasks.push(cosmic::task::message(app::Message::Fetch(
+                cache::extract_notification_images(&notification),
+            )));
+            tasks.push(cosmic::task::message(app::Message::CacheNotification(
+                notification,
+            )));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Persist the currently-cached notifications to disk.
+    pub fn save_cached(&self, cache: &Cache) {
+        let notifications: Vec<Notification> = self
+            .notifications
+            .iter()
+            .filter_map(|id| cache.notifications.get(id).cloned())
+            .collect();
+        crate::persistence::save_notification_snapshot(&self.mastodon.base_url, &notifications);
+    }
+
     pub fn view<'a>(&'a self, cache: &'a Cache) -> Element<'a, Message> {
         let spacing = cosmic::theme::active().cosmic().spacing;
+
+        if self.is_initial_loading() {
+            return widget::container(widget::indeterminate_circular().size(40.0))
+                .center(Length::Fill)
+                .into();
+        }
 
         let labels: Vec<&str> = FILTERS.iter().map(filter_label).collect();
         let selected = FILTERS.iter().position(|f| f == &self.filter);
@@ -85,7 +142,7 @@ impl Notifications {
         .spacing(spacing.space_xs)
         .padding(spacing.space_xs);
 
-        let notifications: Vec<Element<_>> = self
+        let mut notifications: Vec<Element<_>> = self
             .notifications
             .iter()
             .filter_map(|id| cache.notifications.get(id))
@@ -96,6 +153,26 @@ impl Notifications {
             })
             .map(|notification| view::notification(notification, cache).map(Message::Notification))
             .collect();
+
+        if notifications.is_empty() {
+            return widget::column![
+                toolbar,
+                widget::container(widget::text("Nothing here yet")).center(Length::Fill)
+            ]
+            .apply(widget::container)
+            .max_width(700)
+            .height(Length::Fill)
+            .into();
+        }
+
+        if self.loading {
+            notifications.push(
+                widget::container(widget::indeterminate_circular().size(24.0))
+                    .center_x(Length::Fill)
+                    .padding(spacing.space_s)
+                    .into(),
+            );
+        }
 
         widget::column![
             toolbar,
@@ -123,9 +200,10 @@ impl Notifications {
                 }
             }
             Message::AppendNotification(notification) => {
-                self.loading = false;
                 self.max_id = Some(notification.id.clone());
-                self.notifications.push_back(notification.id.clone());
+                if !self.notifications.contains(&notification.id) {
+                    self.notifications.push_back(notification.id.clone());
+                }
                 tasks.push(cosmic::task::message(app::Message::CacheNotification(
                     notification.clone(),
                 )));
@@ -135,10 +213,16 @@ impl Notifications {
                 )));
             }
             Message::PrependNotification(notification) => {
-                self.notifications.push_front(notification.id.clone());
+                if !self.notifications.contains(&notification.id) {
+                    self.notifications.push_front(notification.id.clone());
+                }
                 tasks.push(cosmic::task::message(app::Message::CacheNotification(
                     notification,
                 )));
+            }
+            Message::LoadComplete => {
+                self.loading = false;
+                self.has_loaded = true;
             }
             Message::SetFilter(filter) => self.filter = filter,
             Message::ClearAll => {
@@ -185,7 +269,10 @@ impl Notifications {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        if self.is_authenticated() && (self.notifications.is_empty() || self.loading) {
+        // `!self.has_loaded`, not `self.notifications.is_empty()`: a
+        // cache-preloaded feed already has notifications to show, but still
+        // needs its first real network fetch to refresh in the background.
+        if self.is_authenticated() && (!self.has_loaded || self.loading) {
             return Subscription::batch(vec![fetch::timeline(
                 self.mastodon.clone(),
                 self.max_id.clone(),

@@ -6,7 +6,9 @@ use crate::config::TootConfig;
 use crate::features::compose;
 use crate::features::status::StatusOptions;
 use crate::features::timeline::{Timeline, TimelineKind};
-use crate::features::{accounts, hashtags, lists, notifications, search, settings, status, timeline};
+use crate::features::{
+    accounts, hashtags, lists, notifications, search, settings, status, timeline,
+};
 use crate::fl;
 use cosmic::app::{context_drawer, Core, Task};
 use cosmic::cosmic_config;
@@ -22,7 +24,13 @@ use megalodon::entities::{Account, Notification, Status};
 use megalodon::megalodon::PostStatusInputOptions;
 use megalodon::oauth::AppData;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// How many image downloads run at once. Keeping this bounded (rather than
+/// firing every queued fetch concurrently) means the front of the queue —
+/// newest posts' images, since they're enqueued first — actually gets a
+/// worker slot promptly instead of competing with everything else queued.
+const MAX_CONCURRENT_IMAGE_FETCHES: usize = 6;
 use std::fmt::Display;
 
 const REPOSITORY: &str = "https://github.com/edfloreshz/toot";
@@ -122,6 +130,12 @@ pub struct AppModel {
     /// index is active, persisted to the keychain as a whole.
     sessions: Sessions,
     cache: Cache,
+    /// URLs waiting to be fetched, in priority order (newest posts' images
+    /// are enqueued first). Drained at [`MAX_CONCURRENT_IMAGE_FETCHES`] at a time.
+    image_queue: VecDeque<String>,
+    /// URLs currently being downloaded, so we don't queue or fetch the same
+    /// one twice.
+    image_inflight: HashSet<String>,
     toasts: Toasts<Message>,
     /// The instance's reported maximum status length, used for the compose
     /// dialog's character counter. Defaults to Mastodon's standard limit
@@ -167,7 +181,11 @@ pub enum Message {
     CacheStatus(Status),
     CacheNotification(Notification),
     CacheRelationship(megalodon::entities::Relationship),
+    CacheRelationships(Vec<megalodon::entities::Relationship>),
     CacheHandle(String, Handle),
+    /// An image download failed; drop it from the in-flight set and let the
+    /// next queued one start.
+    ImageFetchFailed(String),
     Dialog(DialogAction),
     EditorAction(widget::text_editor::Action),
     UpdateMastodonInstance,
@@ -183,6 +201,8 @@ pub enum Message {
     /// only logging it and silently dropping the failed action.
     Error(String),
     CloseToast(ToastId),
+    /// Periodic tick: flush every feed's cache to disk if anything changed.
+    FlushCache,
     None,
 }
 
@@ -202,6 +222,8 @@ pub enum Dialog {
     Code(String),
     Logout,
     DeleteStatus(String),
+    /// Show an image attachment full-size: (cached preview URL, original URL).
+    Image(String, String),
 }
 
 pub struct Flags {
@@ -257,6 +279,10 @@ impl Application for AppModel {
             if page == Page::default() {
                 nav.activate(id);
             }
+
+            if mastodon.is_authenticated() && page == Page::Explore {
+                nav.divider_above_set(id, true);
+            }
         }
 
         let about = About::default()
@@ -286,8 +312,11 @@ impl Application for AppModel {
                 let mut cache = Cache::new();
                 cache.hide_boosts = flags.config.hide_boosts;
                 cache.hide_replies = flags.config.hide_replies;
+                cache.feed_density = flags.config.feed_density;
                 cache
             },
+            image_queue: VecDeque::new(),
+            image_inflight: HashSet::new(),
             toasts: Toasts::new(Message::CloseToast),
             max_characters: 500,
             home: Timeline::new(mastodon.clone(), TimelineKind::Home),
@@ -304,7 +333,16 @@ impl Application for AppModel {
 
         app.nav.activate_position(0);
 
-        let mut tasks = vec![app.update_title()];
+        let mut tasks = vec![
+            app.update_title(),
+            app.home.load_cached(),
+            app.notifications.load_cached(),
+            app.explore.load_cached(),
+            app.local.load_cached(),
+            app.federated.load_cached(),
+            app.favorites.load_cached(),
+            app.bookmarks.load_cached(),
+        ];
         if mastodon.is_authenticated() {
             tasks.push(fetch_session_info(mastodon));
         }
@@ -387,9 +425,10 @@ impl Application for AppModel {
                 self.home
                     .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
-            Page::Notifications => tasks.push(self.notifications.update(
-                notifications::Message::SetClient(self.mastodon.clone()),
-            )),
+            Page::Notifications => tasks.push(
+                self.notifications
+                    .update(notifications::Message::SetClient(self.mastodon.clone())),
+            ),
             Page::Search => tasks.push(
                 self.search
                     .update(search::Message::SetClient(self.mastodon.clone())),
@@ -402,10 +441,13 @@ impl Application for AppModel {
                 self.bookmarks
                     .update(timeline::Message::SetClient(self.mastodon.clone())),
             ),
-            Page::Hashtags => tasks.push(
-                self.hashtags
-                    .update(hashtags::Message::SetClient(self.mastodon.clone())),
-            ),
+            Page::Hashtags => {
+                tasks.push(
+                    self.hashtags
+                        .update(hashtags::Message::SetClient(self.mastodon.clone())),
+                );
+                tasks.push(self.hashtags.update(hashtags::Message::Refresh));
+            }
             Page::Lists => tasks.push(
                 self.lists
                     .update(lists::Message::SetClient(self.mastodon.clone())),
@@ -448,8 +490,9 @@ impl Application for AppModel {
                     .title(self.context_page.title())
             }
             ContextPage::Settings => {
-                let content = settings::view(&self.config, &self.sessions.sessions, self.sessions.active)
-                    .map(Message::Settings);
+                let content =
+                    settings::view(&self.config, &self.sessions.sessions, self.sessions.active)
+                        .map(Message::Settings);
                 context_drawer::context_drawer(content, Message::ToggleContextDrawer)
                     .title(self.context_page.title())
             }
@@ -457,6 +500,13 @@ impl Application for AppModel {
     }
 
     fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+        // The image viewer is a full-window overlay (like cosmic-files' gallery
+        // view), not a small centered dialog box, so it's built and returned
+        // before the `widget::dialog()`-based match below.
+        if let Some(Dialog::Image(preview_url, original_url)) = self.dialog_pages.front() {
+            return Some(self.view_image(preview_url.clone(), original_url.clone()));
+        }
+
         let dialog_page = self.dialog_pages.front()?;
 
         let dialog = match dialog_page {
@@ -470,13 +520,19 @@ impl Application for AppModel {
                             .into()
                     })
                 });
-                compose::view(state, reply_preview, &self.dialog_editor, self.max_characters)
+                compose::view(
+                    state,
+                    reply_preview,
+                    &self.dialog_editor,
+                    self.max_characters,
+                )
             }
             Dialog::SwitchInstance(instance) => self.switch_instance(instance.clone()),
             Dialog::Login(instance) => self.login(instance.clone()),
             Dialog::Code(code) => self.code(code.clone()),
             Dialog::Logout => self.logout(),
             Dialog::DeleteStatus(id) => self.delete_status(id.clone()),
+            Dialog::Image(..) => unreachable!("handled above"),
         };
 
         Some(dialog.into())
@@ -492,6 +548,14 @@ impl Application for AppModel {
         }
 
         Task::none()
+    }
+
+    /// Flush the cache before the app closes — otherwise it's only ever
+    /// saved by the periodic 30s tick, so a quick open-then-quit would never
+    /// persist anything.
+    fn on_app_exit(&mut self) -> Option<Self::Message> {
+        self.flush_cache_to_disk();
+        None
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -562,6 +626,11 @@ impl Application for AppModel {
             subscriptions.push(crate::streaming::stream_user_events(self.mastodon.clone()));
         }
 
+        subscriptions.push(
+            cosmic::iced::time::every(std::time::Duration::from_secs(30))
+                .map(|_| Message::FlushCache),
+        );
+
         Subscription::batch(subscriptions)
     }
 
@@ -615,12 +684,30 @@ impl Application for AppModel {
                         }
                     }
                 }
+                settings::Message::SetFeedDensity(density) => {
+                    self.cache.feed_density = density;
+                    if let Some(ref handler) = self.handler {
+                        if let Err(err) = self.config.set_feed_density(handler, density) {
+                            tracing::error!("{err}");
+                        }
+                    }
+                }
+                settings::Message::SetThemeMode(mode) => {
+                    if let Some(ref handler) = self.handler {
+                        if let Err(err) = self.config.set_theme_mode(handler, mode) {
+                            tracing::error!("{err}");
+                        }
+                    }
+                    return cosmic::command::set_theme(self.config.theme_mode.theme());
+                }
                 settings::Message::SwitchAccount(index) => tasks.push(self.switch_account(index)),
                 settings::Message::RemoveAccount(index) => tasks.push(self.remove_account(index)),
                 settings::Message::AddAccount => {
-                    tasks.push(self.update(Message::Dialog(DialogAction::Open(Dialog::Login(
-                        self.instance.clone(),
-                    )))));
+                    tasks.push(
+                        self.update(Message::Dialog(DialogAction::Open(Dialog::Login(
+                            self.instance.clone(),
+                        )))),
+                    );
                 }
             },
             Message::Account(message) => match message {
@@ -714,7 +801,13 @@ impl Application for AppModel {
                 _ => tasks.push(status::update(message)),
             },
             Message::CacheHandle(url, handle) => {
-                self.cache.insert_handle(url.clone(), handle);
+                self.image_inflight.remove(&url);
+                self.cache.insert_handle(url, handle);
+                tasks.push(self.drain_image_queue());
+            }
+            Message::ImageFetchFailed(url) => {
+                self.image_inflight.remove(&url);
+                tasks.push(self.drain_image_queue());
             }
             Message::CacheStatus(status) => {
                 self.cache.insert_status(status.clone());
@@ -725,26 +818,21 @@ impl Application for AppModel {
             Message::CacheRelationship(relationship) => {
                 self.cache.insert_relationship(relationship);
             }
+            Message::CacheRelationships(relationships) => {
+                for relationship in relationships {
+                    self.cache.insert_relationship(relationship);
+                }
+            }
             Message::Fetch(urls) => {
                 for url in urls {
-                    if !self.cache.handles.contains_key(&url) {
-                        tasks.push(cosmic::task::future(async move {
-                            let result = match crate::cache::get(&url).await {
-                                Ok(handle) => Some((url, handle)),
-                                Err(err) => {
-                                    tracing::error!("Failed to fetch image: {}", err);
-                                    None
-                                }
-                            };
-                            match result {
-                                Some((url, handle)) => {
-                                    Message::CacheHandle(url.clone(), handle.clone())
-                                }
-                                None => Message::None,
-                            }
-                        }));
+                    if !self.cache.handles.contains_key(&url)
+                        && !self.image_inflight.contains(&url)
+                        && !self.image_queue.contains(&url)
+                    {
+                        self.image_queue.push_back(url);
                     }
                 }
+                tasks.push(self.drain_image_queue());
             }
             Message::InstanceEdit => {
                 let instance = self.instance.clone();
@@ -860,9 +948,9 @@ impl Application for AppModel {
                                         .next()
                                         .map(Message::CacheRelationship)
                                         .unwrap_or(Message::None),
-                                    Err(err) => Message::Error(format!(
-                                        "Couldn't load relationship: {err}"
-                                    )),
+                                    Err(err) => {
+                                        Message::Error(format!("Couldn't load relationship: {err}"))
+                                    }
                                 }
                             }));
                         }
@@ -949,6 +1037,7 @@ impl Application for AppModel {
                             Dialog::Logout => {
                                 tasks.push(self.remove_account(self.sessions.active));
                             }
+                            Dialog::Image(..) => {}
                         }
                     }
                 }
@@ -961,11 +1050,16 @@ impl Application for AppModel {
             }
             Message::Error(message) => {
                 tracing::error!("{message}");
-                tasks.push(self.toasts.push(Toast::new(message)).map(cosmic::Action::App));
+                tasks.push(
+                    self.toasts
+                        .push(Toast::new(message))
+                        .map(cosmic::Action::App),
+                );
             }
             Message::CloseToast(id) => {
                 self.toasts.remove(id);
             }
+            Message::FlushCache => self.flush_cache_to_disk(),
             Message::None => (),
         }
         Task::batch(tasks)
@@ -984,33 +1078,117 @@ impl AppModel {
     fn update_all_clients(&mut self) -> Task<Message> {
         let mastodon = self.mastodon.clone();
         Task::batch(vec![
-            self.home.update(timeline::Message::SetClient(mastodon.clone())),
+            self.home
+                .update(timeline::Message::SetClient(mastodon.clone())),
             self.notifications
                 .update(notifications::Message::SetClient(mastodon.clone())),
-            self.explore.update(timeline::Message::SetClient(mastodon.clone())),
-            self.local.update(timeline::Message::SetClient(mastodon.clone())),
-            self.federated.update(timeline::Message::SetClient(mastodon.clone())),
-            self.favorites.update(timeline::Message::SetClient(mastodon.clone())),
-            self.bookmarks.update(timeline::Message::SetClient(mastodon.clone())),
-            self.hashtags.update(hashtags::Message::SetClient(mastodon.clone())),
-            self.lists.update(lists::Message::SetClient(mastodon.clone())),
+            self.explore
+                .update(timeline::Message::SetClient(mastodon.clone())),
+            self.local
+                .update(timeline::Message::SetClient(mastodon.clone())),
+            self.federated
+                .update(timeline::Message::SetClient(mastodon.clone())),
+            self.favorites
+                .update(timeline::Message::SetClient(mastodon.clone())),
+            self.bookmarks
+                .update(timeline::Message::SetClient(mastodon.clone())),
+            self.hashtags
+                .update(hashtags::Message::SetClient(mastodon.clone())),
+            self.lists
+                .update(lists::Message::SetClient(mastodon.clone())),
             self.search.update(search::Message::SetClient(mastodon)),
         ])
     }
 
+    /// Drop every feed's in-memory content and reload each from the newly
+    /// active account's own disk cache, so switching accounts doesn't leave
+    /// the previous account's posts visible until a fresh fetch lands.
+    fn reset_and_reload_feeds(&mut self) -> Task<Message> {
+        let mastodon = self.mastodon.clone();
+        self.home.reset(mastodon.clone());
+        self.explore.reset(mastodon.clone());
+        self.local.reset(mastodon.clone());
+        self.federated.reset(mastodon.clone());
+        self.favorites.reset(mastodon.clone());
+        self.bookmarks.reset(mastodon.clone());
+        self.notifications.reset(mastodon.clone());
+        let load_tasks = vec![
+            self.home.load_cached(),
+            self.explore.load_cached(),
+            self.local.load_cached(),
+            self.federated.load_cached(),
+            self.favorites.load_cached(),
+            self.bookmarks.load_cached(),
+            self.notifications.load_cached(),
+        ];
+        Task::batch(vec![
+            self.hashtags
+                .update(hashtags::Message::SetClient(mastodon.clone())),
+            self.lists
+                .update(lists::Message::SetClient(mastodon.clone())),
+            self.search.update(search::Message::SetClient(mastodon)),
+            Task::batch(load_tasks),
+        ])
+    }
+
+    /// Start image downloads for as many queued URLs as fit under
+    /// [`MAX_CONCURRENT_IMAGE_FETCHES`], taking from the front of the queue
+    /// first (i.e. whichever were requested earliest — newest posts, since
+    /// they're rendered and their images requested before older ones).
+    fn drain_image_queue(&mut self) -> Task<Message> {
+        let mut tasks = vec![];
+        while self.image_inflight.len() < MAX_CONCURRENT_IMAGE_FETCHES {
+            let Some(url) = self.image_queue.pop_front() else {
+                break;
+            };
+            self.image_inflight.insert(url.clone());
+            tasks.push(cosmic::task::future(async move {
+                match crate::cache::get(&url).await {
+                    Ok(handle) => Message::CacheHandle(url, handle),
+                    Err(err) => {
+                        tracing::error!("Failed to fetch image: {}", err);
+                        Message::ImageFetchFailed(url)
+                    }
+                }
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Save every feed's cached content to disk, if anything changed since
+    /// the last flush.
+    fn flush_cache_to_disk(&mut self) {
+        if !self.cache.dirty {
+            return;
+        }
+        self.home.save_cached(&self.cache);
+        self.explore.save_cached(&self.cache);
+        self.local.save_cached(&self.cache);
+        self.federated.save_cached(&self.cache);
+        self.favorites.save_cached(&self.cache);
+        self.bookmarks.save_cached(&self.cache);
+        self.notifications.save_cached(&self.cache);
+        self.cache.dirty = false;
+    }
+
     /// Switch to the saved account at `index`, resetting per-account state.
     fn switch_account(&mut self, index: usize) -> Task<Message> {
-        let Some(session) = self.sessions.sessions.get(index) else {
+        let Some(session) = self.sessions.sessions.get(index).cloned() else {
             return Task::none();
         };
+        self.flush_cache_to_disk();
         self.sessions.active = index;
-        self.mastodon = Client::new(session.base_url.clone(), Some(session.token.clone()));
+        self.mastodon = Client::new(session.base_url, Some(session.token));
         self.cache.clear();
         self.cache.hide_boosts = self.config.hide_boosts;
         self.cache.hide_replies = self.config.hide_replies;
+        self.cache.feed_density = self.config.feed_density;
         self.update_navbar();
 
-        let mut tasks = vec![self.update_all_clients(), self.on_nav_select(self.nav.active())];
+        let mut tasks = vec![
+            self.reset_and_reload_feeds(),
+            self.on_nav_select(self.nav.active()),
+        ];
         if let Err(err) = self.persist_sessions() {
             tasks.push(cosmic::task::message(Message::Error(format!(
                 "Couldn't save session: {err}"
@@ -1024,7 +1202,18 @@ impl AppModel {
     /// another remaining account or falls back to a logged-out client.
     fn remove_account(&mut self, index: usize) -> Task<Message> {
         let was_active = index == self.sessions.active;
+        let removed_base_url = self
+            .sessions
+            .sessions
+            .get(index)
+            .map(|s| s.base_url.clone());
+        if was_active {
+            self.flush_cache_to_disk();
+        }
         self.sessions.remove(index);
+        if let Some(base_url) = removed_base_url {
+            crate::persistence::clear_account(&base_url);
+        }
 
         let mut tasks = vec![];
         if let Err(err) = self.persist_sessions() {
@@ -1045,8 +1234,9 @@ impl AppModel {
             self.cache.clear();
             self.cache.hide_boosts = self.config.hide_boosts;
             self.cache.hide_replies = self.config.hide_replies;
+            self.cache.feed_density = self.config.feed_density;
             self.update_navbar();
-            tasks.push(self.update_all_clients());
+            tasks.push(self.reset_and_reload_feeds());
             tasks.push(self.on_nav_select(self.nav.active()));
         }
         Task::batch(tasks)
@@ -1159,13 +1349,76 @@ impl AppModel {
             )
     }
 
+    /// A full-window image overlay, in the same spirit as cosmic-files'
+    /// gallery view: a translucent backdrop covering the whole window with
+    /// the image centered and content-fit, rather than a small dialog box.
+    fn view_image(&self, preview_url: String, original_url: String) -> Element<'_, Message> {
+        let spacing = cosmic::theme::active().cosmic().spacing;
+
+        let image: Element<'_, Message> = self
+            .cache
+            .handles
+            .get(&preview_url)
+            .map(|handle| {
+                widget::image(handle)
+                    .content_fit(cosmic::iced::ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            })
+            .unwrap_or_else(|| widget::text("Image not available").into());
+
+        // Fixed, matching top/bottom bars so the image's `Length::Fill` area
+        // in between is symmetric — an empty bottom bar mirrors the header's
+        // height rather than letting the image run flush to the window edge.
+        // The fixed height is on the *wrapping container*, not the row itself,
+        // so the buttons are centered within it rather than being squashed
+        // to fit. Generous headroom above the row's own intrinsic size
+        // (buttons + padding) so the container never has to compress it —
+        // a too-tight fixed height here is what squashed the buttons before.
+        let bar_height = Length::Fixed(96.0);
+
+        let header_row = widget::row![
+            widget::space::horizontal(),
+            widget::button::icon(widget::icon::from_name("send-to-symbolic"))
+                .class(cosmic::style::Button::Standard)
+                .on_press(Message::Open(original_url)),
+            widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                .class(cosmic::style::Button::Standard)
+                .on_press(Message::Dialog(DialogAction::Close)),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .spacing(spacing.space_xs)
+        .padding(spacing.space_xs);
+
+        let header = widget::container(header_row)
+            .width(Length::Fill)
+            .height(bar_height)
+            .align_y(Vertical::Center);
+
+        let footer = widget::container(widget::text(""))
+            .width(Length::Fill)
+            .height(bar_height);
+
+        widget::column![header, widget::container(image).center(Length::Fill), footer]
+            .apply(widget::container)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(cosmic::style::Container::Dialog(false))
+            .into()
+    }
+
     fn status(&self, id: &String) -> Element<'_, Message> {
         let status = self.cache.statuses.get(id).map(|status| {
-            status::status(status, StatusOptions::new(true, true, true, false), &self.cache)
-                .map(timeline::Message::Status)
-                .map(Message::Home)
-                .apply(widget::container)
-                .class(cosmic::theme::Container::Dialog(false))
+            status::status(
+                status,
+                StatusOptions::new(true, true, true, false),
+                &self.cache,
+            )
+            .map(timeline::Message::Status)
+            .map(Message::Home)
+            .apply(widget::container)
+            .class(cosmic::theme::Container::Dialog(false))
         });
         widget::column![status].into()
     }

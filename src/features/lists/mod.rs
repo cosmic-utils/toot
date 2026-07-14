@@ -1,6 +1,10 @@
 //! User lists: browse the account's lists and view a selected list's timeline.
 
-use cosmic::{app::Task, iced::Subscription, widget, Apply, Element};
+use cosmic::{
+    app::Task,
+    iced::{Alignment, Length, Subscription},
+    widget, Apply, Element,
+};
 use megalodon::entities::List;
 
 use crate::{
@@ -64,8 +68,13 @@ impl Lists {
             content,
         ]
         .spacing(spacing.space_xs)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .apply(widget::container)
         .max_width(700)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Start)
         .into()
     }
 
@@ -82,7 +91,10 @@ impl Lists {
                 self.loaded = true;
             }
             Message::Select(id) => {
-                self.selected = Some(Timeline::new(self.mastodon.clone(), TimelineKind::List(id)));
+                let mut timeline = Timeline::new(self.mastodon.clone(), TimelineKind::List(id));
+                let task = timeline.load_cached();
+                self.selected = Some(timeline);
+                return task;
             }
             Message::Timeline(message) => {
                 if let Some(timeline) = &mut self.selected {

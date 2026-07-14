@@ -9,6 +9,7 @@ use megalodon::entities::{Account, Status};
 use crate::{
     app,
     cache::{self, Cache},
+    config::FeedDensity,
     features::compose,
 };
 
@@ -21,6 +22,8 @@ pub enum Message {
     Boost(String, bool),
     Bookmark(String, bool),
     OpenLink(String),
+    /// Show an image attachment in an overlay: (cached preview URL, original URL).
+    ViewImage(String, String),
     /// Request to delete one of the authenticated user's own statuses;
     /// opens a confirmation dialog rather than deleting immediately.
     Delete(String),
@@ -66,12 +69,14 @@ pub fn status<'a>(
         .map(|reblog| cache.statuses.get(&reblog.id.to_string()).unwrap_or(reblog))
         .unwrap_or(status);
 
+    let density = cache.feed_density;
+
     widget::column![
         reblog_button,
-        header(status, cache),
+        header(status, cache, density),
         content(status, options),
-        card(status, cache),
-        media(status, cache, options),
+        card(status, cache, density),
+        media(status, cache, options, density),
         tags(status, options),
         actions(status, options, cache),
     ]
@@ -81,32 +86,62 @@ pub fn status<'a>(
     .into()
 }
 
-fn card<'a>(status: &'a Status, cache: &'a Cache) -> Option<Element<'a, Message>> {
+fn card<'a>(
+    status: &'a Status,
+    cache: &'a Cache,
+    density: FeedDensity,
+) -> Option<Element<'a, Message>> {
+    if density == FeedDensity::TextOnly {
+        return None;
+    }
+    let compact = density == FeedDensity::Compact;
+
     let spacing = cosmic::theme::active().cosmic().spacing;
     status.card.as_ref().map(|card| {
         let avatar = card.image.as_ref().map(|image| {
-            cache
+            let fallback = cache::fallback_avatar();
+            let handle = cache
                 .handles
                 .get(image)
                 .map(widget::image)
-                .unwrap_or(cache::fallback_avatar())
+                .unwrap_or(fallback);
+            if compact {
+                handle
+                    .width(150.0)
+                    .height(Length::Fill)
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+            } else {
+                handle
+            }
         });
 
-        widget::column![
-            avatar,
-            widget::column![
-                widget::text::title4(&card.title),
-                widget::text(&card.description),
-            ]
-            .spacing(spacing.space_xs)
-            .padding(spacing.space_xs),
+        let text = widget::column![
+            widget::text::title4(&card.title).wrapping(cosmic::iced::core::text::Wrapping::Word),
+            widget::text(&card.description).wrapping(cosmic::iced::core::text::Wrapping::Word),
         ]
-        .apply(widget::container)
-        .class(cosmic::style::Container::Dialog(false))
-        .apply(widget::button::custom)
-        .class(cosmic::style::Button::Image)
-        .on_press(Message::OpenLink(card.url.clone()))
-        .into()
+        .spacing(spacing.space_xs)
+        .padding(spacing.space_xs)
+        .width(Length::Fill);
+
+        let content: Element<'_, Message> = if compact {
+            widget::row![avatar, text]
+                .spacing(spacing.space_xs)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into()
+        } else {
+            widget::column![avatar, text].into()
+        };
+
+        content
+            .apply(widget::container)
+            .width(Length::Fill)
+            .class(cosmic::style::Container::Dialog(false))
+            .apply(widget::button::custom)
+            .width(Length::Fill)
+            .class(cosmic::style::Button::Image)
+            .on_press(Message::OpenLink(card.url.clone()))
+            .into()
     })
 }
 
@@ -134,13 +169,22 @@ pub fn update(message: Message) -> Task<app::Message> {
             Message::Bookmark(status_id, bookmarked),
         )),
         Message::OpenLink(url) => cosmic::task::message(app::Message::Open(url.to_string())),
+        Message::ViewImage(preview_url, original_url) => {
+            cosmic::task::message(app::Message::Dialog(app::DialogAction::Open(
+                app::Dialog::Image(preview_url, original_url),
+            )))
+        }
         Message::Delete(status_id) => cosmic::task::message(app::Message::Dialog(
             app::DialogAction::Open(app::Dialog::DeleteStatus(status_id)),
         )),
     }
 }
 
-fn actions<'a>(status: &'a Status, options: StatusOptions, cache: &'a Cache) -> Option<Element<'a, Message>> {
+fn actions<'a>(
+    status: &'a Status,
+    options: StatusOptions,
+    cache: &'a Cache,
+) -> Option<Element<'a, Message>> {
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let delete_button = cache.is_me(&status.account.id).then(|| {
@@ -225,14 +269,32 @@ fn media<'a>(
     status: &'a Status,
     cache: &'a Cache,
     options: StatusOptions,
+    density: FeedDensity,
 ) -> Option<cosmic::iced::widget::Scrollable<'a, Message, cosmic::Theme>> {
+    if density == FeedDensity::TextOnly {
+        return None;
+    }
+    let compact = density == FeedDensity::Compact;
+
     let spacing = cosmic::theme::active().cosmic().spacing;
 
     let attachments = status
         .media_attachments
         .iter()
         .map(|media| {
-            widget::button::image(
+            let is_picture = matches!(
+                media.r#type,
+                megalodon::entities::attachment::AttachmentType::Image
+                    | megalodon::entities::attachment::AttachmentType::Gifv
+            );
+            let on_press = match &media.preview_url {
+                Some(preview_url) if is_picture => {
+                    Message::ViewImage(preview_url.clone(), media.url.clone())
+                }
+                _ => Message::OpenLink(media.url.clone()),
+            };
+
+            let button = widget::button::image(
                 media
                     .preview_url
                     .as_ref()
@@ -240,8 +302,12 @@ fn media<'a>(
                     .cloned()
                     .unwrap_or(crate::cache::fallback_handle()),
             )
-            .on_press(Message::OpenLink(media.url.clone()))
-            .into()
+            .on_press(on_press);
+            if compact {
+                button.width(80.0).height(80.0).into()
+            } else {
+                button.into()
+            }
         })
         .collect::<Vec<Element<Message>>>();
 
@@ -265,7 +331,7 @@ fn tags(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>>
                     .into()
             })
             .collect::<Vec<Element<Message>>>();
-        widget::row(tags).spacing(spacing.space_xxs).into()
+        widget::flex_row(tags).spacing(spacing.space_xxs).into()
     });
     tags
 }
@@ -273,8 +339,14 @@ fn tags(status: &Status, options: StatusOptions) -> Option<Element<'_, Message>>
 fn header<'a>(
     status: &'a Status,
     cache: &'a Cache,
+    density: FeedDensity,
 ) -> cosmic::widget::Row<'a, Message, cosmic::Theme> {
     let spacing = cosmic::theme::active().cosmic().spacing;
+    let avatar_size = if density == FeedDensity::Full {
+        50.0
+    } else {
+        36.0
+    };
 
     let header = widget::row![
         widget::button::image(
@@ -284,16 +356,20 @@ fn header<'a>(
                 .cloned()
                 .unwrap_or(crate::cache::fallback_handle()),
         )
-        .width(50)
-        .height(50)
+        .width(avatar_size)
+        .height(avatar_size)
         .on_press(Message::OpenAccount(status.account.clone())),
-        widget::column![
-            widget::text(status.account.display_name.clone()).size(18),
-            widget::button::link(format!("@{}", status.account.username.clone()))
-                .on_press(Message::OpenAccount(status.account.clone())),
-        ]
-        .align_x(Alignment::Center)
-        .spacing(spacing.space_xs),
+        widget::column![]
+            .push_maybe(
+                (!status.account.display_name.is_empty())
+                    .then(|| { widget::text(status.account.display_name.clone()).size(18) })
+            )
+            .push(
+                widget::button::link(format!("@{}", status.account.username.clone()))
+                    .on_press(Message::OpenAccount(status.account.clone())),
+            )
+            .align_x(Alignment::Center)
+            .spacing(spacing.space_xs),
     ]
     .align_y(Alignment::Center)
     .spacing(spacing.space_xs);

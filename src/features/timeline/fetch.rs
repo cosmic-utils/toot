@@ -117,6 +117,9 @@ pub fn timeline(mastodon: Client, kind: TimelineKind, max_id: Option<String>) ->
                     tracing::warn!("failed to get {:?} timeline: {}", kind, err);
                 }
             }
+            if let Err(err) = output.send(Message::LoadComplete).await {
+                tracing::warn!("failed to send load-complete: {}", err);
+            }
 
             std::future::pending().await
         })
